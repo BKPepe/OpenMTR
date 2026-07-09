@@ -25,12 +25,12 @@
 // Windows networking / ICMP — the two defines must precede <winsock2.h>.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <icmpapi.h>
-#include <iphlpapi.h>
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2ipdef.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <icmpapi.h>
 #else
 #include <sys/socket.h>
 #include <sys/types.h>

@@ -68,6 +68,7 @@ static void setMacOsDarkAppearance(WId winId, bool dark) {
 #include <QtGui/QPalette>
 #include <QtGui/QResizeEvent>
 #include <QtGui/QShortcut>
+#include <QtGui/QKeySequence>
 #include <QtGui/QClipboard>
 #include <QtGui/QStyleHints>
 #include <QtWidgets/QApplication>
@@ -77,7 +78,9 @@ static void setMacOsDarkAppearance(WId winId, bool dark) {
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QStyleFactory>
 #include <QtWidgets/QVBoxLayout>
+#ifndef Q_OS_WIN
 #include <QtWidgets/QFileDialog>
+#endif
 #include <QtCore/QProcess>
 
 // Windows.
