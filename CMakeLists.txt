@@ -3,6 +3,11 @@
 # ============================================================================
 
 cmake_minimum_required(VERSION 3.22)
+
+if(APPLE)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum OS X version" FORCE)
+endif()
+
 project(OpenMTR VERSION 1.2.0 LANGUAGES CXX)
 
 # ---- Language & Qt code generation -----------------------------------------
