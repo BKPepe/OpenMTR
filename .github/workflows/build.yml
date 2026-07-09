@@ -211,10 +211,7 @@ jobs:
 
       - name: Deploy macOS App Bundle
         run: |
-          # Run deployment without creating the DMG yet, and skip unneeded modules to avoid rpath errors
-          $(brew --prefix qt)/bin/macdeployqt build/OpenMTR.app -always-overwrite -no-plugins -no-strip
-        env:
-          DYLD_LIBRARY_PATH: /opt/homebrew/lib:/opt/homebrew/opt/qt/lib
+          $(brew --prefix qt)/bin/macdeployqt build/OpenMTR.app -always-overwrite -no-strip -libpath=$(brew --prefix)/lib
 
       - name: Fix Codesign (Ad-hoc)
         run: |
