@@ -326,6 +326,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     sockaddr_in6 destAddr6 = {};
     static const sockaddr_in6 srcAny = { AF_INET6, 0, 0, in6addr_any, 0 };
 
+    m_isV6 = isV6;
     if (isV6) {
         m_hops[0].addr6.sin6_family = AF_INET6;
         last_remote_addr6 = ((sockaddr_in6*)dest)->sin6_addr;
@@ -556,7 +557,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     // macOS (like the BSDs) delivers a copy of every inbound ICMP message to
     // every open ICMP dgram socket — there is no per-socket demultiplexing
     // by echo id the way Linux ping sockets do it. The sequence number alone
-    // is deterministic ((hop << 11) | slot), so two concurrent traces (a
+    // is deterministic ((hop << 11) | probe count), so two concurrent traces (a
     // second OpenMTR, ping, mtr …) collide on it and record each other's
     // packets: a silent hop inherits a fabricated address from a foreign
     // reply, and a foreign packet clearing `pending` early makes the real
@@ -582,6 +583,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     sockaddr_in  destAddr4 = {};
     sockaddr_in6 destAddr6 = {};
 
+    m_isV6 = isV6;
     if (isV6) {
         last_remote_addr6 = ((sockaddr_in6*)dest)->sin6_addr;
         destAddr6 = *(sockaddr_in6*)dest;
@@ -636,6 +638,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         bool      retired       = false;
         ULONGLONG t0            = 0;
         ULONGLONG slot          = 0;
+        ULONGLONG seq           = 0;
         ULONGLONG lastProbeTick = 0;
         uint16_t  sentSeq       = 0;
         ULONGLONG sentTime      = 0;
@@ -648,6 +651,26 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         hs.t0   = globalT0 + (ULONGLONG)i * 50;
         hs.slot = 0;
     }
+
+    // Ends a hop's probe, whatever became of it, with the same resync as the
+    // Windows complete() lambda: skip the slots a gap consumed so the hop
+    // resumes on schedule instead of firing the backlog at RTT speed. Every
+    // path that clears `pending` goes through here, send failures included —
+    // one that did not would leave nextDue() in the past and the loop would
+    // spin. A hop is only finished after submit(), which never runs before
+    // its t0, so the subtraction cannot wrap.
+    auto finish = [&](PosixHopState& hs) {
+        hs.pending = false;
+        hs.slot = (GetTickCount64() - hs.t0) / intervalMs + 1;
+    };
+
+    // A probe that never left the machine: say why, count it, finish it.
+    auto failSend = [&](PosixHopState& hs, int err) {
+        const DWORD st = SendStatusFor(err);
+        SetErrorName(hs.ttl - 1, st);
+        RecordProbe(hs.ttl - 1, false, 0, st);
+        finish(hs);
+    };
 
     // sendto() for a probe. On Linux a ping socket with IP_RECVERR also keeps
     // the last ICMP error it queued in sk_err — a router's Time Exceeded
@@ -672,14 +695,14 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     // its top five bits so a reply can be matched back to its hop without
     // any extra per-hop state travelling over the wire (see the reply
     // parsing below). Five bits, not a whole byte: MAX_HOPS only needs five,
-    // and the eleven bits left for the per-hop slot counter push its
+    // and the eleven bits left for the per-hop probe counter push its
     // wrap-around from 256 probes (~4 min at the 1 s interval — a reply
     // delayed past that could match a fresh probe of the same hop) out to
     // 2048 (~34 min).
     static_assert(MAX_HOPS <= 32, "hop index must fit the top 5 bits of icmp_seq");
     auto submit = [&](PosixHopState& hs) {
-        hs.slot++;
-        uint16_t seq  = (uint16_t)(((hs.ttl - 1) << 11) | (hs.slot & 0x7FF));
+        hs.seq++;
+        uint16_t seq  = (uint16_t)(((hs.ttl - 1) << 11) | (hs.seq & 0x7FF));
         hs.sentSeq    = seq;
         hs.sentTime   = GetTickCount64();
         hs.lastProbeTick = hs.sentTime;
@@ -691,10 +714,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
             // hop's TTL, so the reply would be filed against the wrong row.
             // Count it as a failed probe instead of quietly mismeasuring.
             if (::setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, sizeof(val)) < 0) {
-                const DWORD st = SendStatusFor(errno);
-                SetErrorName(hs.ttl - 1, st);
-                RecordProbe(hs.ttl - 1, false, 0, st);
-                hs.pending = false;
+                failSend(hs, errno);
                 return;
             }
 
@@ -710,19 +730,13 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
 
             const ssize_t sent = sendProbe(pkt, (sockaddr*)&destAddr6, sizeof(sockaddr_in6));
             if (sent < 0) {
-                const DWORD st = SendStatusFor(errno);
-                SetErrorName(hs.ttl - 1, st);
-                RecordProbe(hs.ttl - 1, false, 0, st);
-                hs.pending = false;
+                failSend(hs, errno);
             }
         } else {
             int val = hs.ttl;
             // Same reasoning as the v6 hop limit above.
             if (::setsockopt(fd, IPPROTO_IP, IP_TTL, &val, sizeof(val)) < 0) {
-                const DWORD st = SendStatusFor(errno);
-                SetErrorName(hs.ttl - 1, st);
-                RecordProbe(hs.ttl - 1, false, 0, st);
-                hs.pending = false;
+                failSend(hs, errno);
                 return;
             }
 
@@ -746,10 +760,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
 
             const ssize_t sent = sendProbe(pkt, (sockaddr*)&destAddr4, sizeof(sockaddr_in));
             if (sent < 0) {
-                const DWORD st = SendStatusFor(errno);
-                SetErrorName(hs.ttl - 1, st);
-                RecordProbe(hs.ttl - 1, false, 0, st);
-                hs.pending = false;
+                failSend(hs, errno);
             }
         }
     };
@@ -816,7 +827,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                 continue;
             if (hs.pending) {
                 if (now > hs.sentTime + ECHO_REPLY_TIMEOUT) {
-                    hs.pending = false;
+                    finish(hs);
                     // Mirrors the Windows dispatch loop's complete() lambda,
                     // which calls this for IP_REQ_TIMED_OUT too (see above) -
                     // this was the one call missing here, which is why a
@@ -987,7 +998,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                                 ULONGLONG nowRecv = GetTickCount64();
                                 int rtt = (int)(nowRecv - hs.sentTime);
                                 if (rtt <= 0) rtt = 1;
-                                hs.pending = false;
+                                finish(hs);
 
                                 if (isReply || icmp->icmp_type == ICMP_TIMXCEED) {
                                     RecordProbe(hopIndex, true, rtt);
@@ -1055,7 +1066,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                                 ULONGLONG nowRecv = GetTickCount64();
                                 int rtt = (int)(nowRecv - hs.sentTime);
                                 if (rtt <= 0) rtt = 1;
-                                hs.pending = false;
+                                finish(hs);
 
                                 if (isReply || icmp6->icmp6_type == ICMP6_TIME_EXCEEDED) {
                                     RecordProbe(hopIndex, true, rtt);
@@ -1151,7 +1162,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                 const ULONGLONG nowRecv = GetTickCount64();
                 int rtt = (int)(nowRecv - hs.sentTime);
                 if (rtt <= 0) rtt = 1;
-                hs.pending = false;
+                finish(hs);
 
                 const bool isTimeExceeded = isV6 ? (ee->ee_type == ICMP6_TIME_EXCEEDED)
                                                   : (ee->ee_type == ICMP_TIMXCEED);
@@ -1346,7 +1357,7 @@ int OpenMTRNet::GetMax()
 int OpenMTRNet::RecalcMaxLocked()
 {
     int max = 0;
-    if (m_hops[0].addr6.sin6_family == AF_INET6) {
+    if (m_isV6) {
         for (; max < MAX_HOPS && memcmp(&m_hops[max++].addr6.sin6_addr, &last_remote_addr6, sizeof(in6_addr)););
         if (max == MAX_HOPS) {
             while (max > 1

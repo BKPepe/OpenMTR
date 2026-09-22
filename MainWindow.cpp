@@ -2700,15 +2700,47 @@ void MainWindow::hideIconTooltip()
 //  ASN lookup
 // ==========================================================================
 
+// True for addresses Team Cymru cannot answer for, so the query is skipped.
+// Parsed rather than prefix-matched: the old "172." test threw away the whole
+// of 172/8 when only 172.16/12 is private, hiding Google and Cloudflare, and
+// it missed 100.64/10 in the other direction. inet_pton rather than
+// QHostAddress because that lives in Qt6::Network, which this app does not
+// link.
+static bool isUnroutableForAsn(const QString& ip)
+{
+    const QByteArray raw = ip.toUtf8();
+
+    in_addr v4{};
+    if (inet_pton(AF_INET, raw.constData(), &v4) == 1) {
+        // Explicit cast: ntohl() returns u_long on Windows, and the MSVC
+        // build compiles with /W4 /WX.
+        const uint32_t a = static_cast<uint32_t>(ntohl(v4.s_addr));
+        return (a & 0xFF000000u) == 0x0A000000u   // 10/8
+            || (a & 0xFFF00000u) == 0xAC100000u   // 172.16/12  (NOT all of 172/8)
+            || (a & 0xFFFF0000u) == 0xC0A80000u   // 192.168/16
+            || (a & 0xFF000000u) == 0x7F000000u   // 127/8 loopback
+            || (a & 0xFFFF0000u) == 0xA9FE0000u   // 169.254/16 link-local
+            || (a & 0xFFC00000u) == 0x64400000u   // 100.64/10 CGNAT
+            || a == 0u;                           // 0.0.0.0
+    }
+
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, raw.constData(), &v6) == 1) {
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(&v6);
+        if ((b[0] & 0xFE) == 0xFC) return true;                  // fc00::/7 ULA
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true;  // fe80::/10 link-local
+        for (int i = 0; i < 16; ++i) if (b[i]) return false;
+        return true;                                             // ::
+    }
+
+    return true;   // not an address we can query for
+}
+
 // Resolve an IP to its ASN via Team Cymru's DNS service. Skips private and
 // link-local ranges. Blocking — must be called off the UI thread.
 QString MainWindow::lookupASN(const QString& ip, bool ipv6)
 {
-    if (ip.isEmpty() || ip == "0.0.0.0" || ip == "::"
-        || ip.startsWith("192.168.") || ip.startsWith("10.")
-        || ip.startsWith("172.")     || ip.startsWith("127.")
-        || ip.startsWith("169.254")  || ip.startsWith("fe80")
-        || ip.startsWith("fc")       || ip.startsWith("fd"))
+    if (ip.isEmpty() || isUnroutableForAsn(ip))
         return QString();
 
     QString query;

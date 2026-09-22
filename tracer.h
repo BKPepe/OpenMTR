@@ -367,6 +367,10 @@ private:
     // Cached route length, recomputed under m_mutex whenever a hop address
     // changes and read lock-free by the dispatch loop once per probe cycle.
     std::atomic<int>  m_maxHops{MAX_HOPS};
+    // Which family this trace is running. Set once by DoTrace() before any
+    // probe goes out, so RecalcMaxLocked() does not have to infer it from
+    // whether hop 1 has answered yet.
+    bool              m_isV6 = false;
 
     // Wakes the async dispatch loop in DoTrace() immediately when
     // StopTrace() is called, instead of leaving it to notice on its next
