@@ -2338,6 +2338,12 @@ private:
     bool    m_tracing      = false;
     bool    m_darkMode     = true;
     bool    m_counting     = false;
+#ifdef Q_OS_MAC
+    // The native-title-bar height correction in applyFramelessStyle() is a
+    // one-time startup adjustment, so it must not re-run on later window
+    // state changes and overwrite a size the user chose. See there.
+    bool    m_macChromeAdjusted = false;
+#endif
     QTimer* m_refreshTimer = nullptr;
     QTimer* m_elapsedTimer = nullptr;
     QTimer* m_warmupTimer  = nullptr;
