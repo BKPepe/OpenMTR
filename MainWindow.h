@@ -2343,6 +2343,9 @@ private:
     // one-time startup adjustment, so it must not re-run on later window
     // state changes and overwrite a size the user chose. See there.
     bool    m_macChromeAdjusted = false;
+    // NSProcessInfo activity held from a trace's start to its Stop, so App
+    // Nap cannot throttle the measurement (see beginMacOsTraceActivity()).
+    void*   m_macTraceActivity = nullptr;
 #endif
     QTimer* m_refreshTimer = nullptr;
     QTimer* m_elapsedTimer = nullptr;

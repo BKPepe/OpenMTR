@@ -91,6 +91,48 @@ static void setMacOsWindowSubtitle(WId winId, const QString& subtitle)
     reinterpret_cast<void (*)(id, SEL, id)>(objc_msgSend)(
         window, sel_registerName("setSubtitle:"), nsSubtitle);
 }
+
+// Keep App Nap away while a trace runs. OpenMTR measures time: an RTT is
+// when the dispatch loop reads the reply minus when the probe went out.
+// Once the window is covered or another app is in front, macOS naps the
+// process — timers are coalesced, threads wait — and the probe schedule and
+// every RTT stretch by up to seconds. An NSProcessInfo activity is the
+// documented way out. UserInitiatedAllowingIdleSystemSleep keeps the app
+// running at full speed without keeping the Mac awake; LatencyCritical keeps
+// its timers precise. Returns the activity, retained, or nullptr.
+static void* beginMacOsTraceActivity()
+{
+    id info = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSProcessInfo")),
+        sel_registerName("processInfo"));
+    if (!info) return nullptr;
+    id reason = reinterpret_cast<id (*)(id, SEL, const char*)>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSString")),
+        sel_registerName("stringWithUTF8String:"),
+        "Tracing a route");
+    // NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
+    const unsigned long long options = 0x00EFFFFFULL | 0xFF00000000ULL;
+    id activity = reinterpret_cast<id (*)(id, SEL, unsigned long long, id)>(objc_msgSend)(
+        info, sel_registerName("beginActivityWithOptions:reason:"), options, reason);
+    if (!activity) return nullptr;
+    // Autoreleased: keep it past the current pool, until the trace ends.
+    reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(activity, sel_registerName("retain"));
+    return activity;
+}
+
+// Ends an activity from beginMacOsTraceActivity(); does nothing for nullptr.
+static void endMacOsTraceActivity(void*& activity)
+{
+    if (!activity) return;
+    id token = static_cast<id>(activity);
+    id info = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(
+        reinterpret_cast<id>(objc_getClass("NSProcessInfo")),
+        sel_registerName("processInfo"));
+    reinterpret_cast<void (*)(id, SEL, id)>(objc_msgSend)(
+        info, sel_registerName("endActivity:"), token);
+    reinterpret_cast<void (*)(id, SEL)>(objc_msgSend)(token, sel_registerName("release"));
+    activity = nullptr;
+}
 #endif
 
 // Qt.
@@ -426,11 +468,15 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 // Members tear themselves down; nothing to do by hand, except unhook the
-// qApp-wide event filter installed for Linux's borderless-resize handling.
+// qApp-wide event filter installed for Linux's borderless-resize handling
+// and, on macOS, end a trace activity that is still held.
 MainWindow::~MainWindow()
 {
 #ifdef Q_OS_LINUX
     qApp->removeEventFilter(this);
+#endif
+#ifdef Q_OS_MAC
+    endMacOsTraceActivity(m_macTraceActivity);
 #endif
 }
 
@@ -2843,6 +2889,9 @@ void MainWindow::onStartStop()
         // reset the UI now, then poll a timer until the thread has finished.
         m_stopSource.request_stop();
         m_stopSource = std::stop_source{};
+#ifdef Q_OS_MAC
+        endMacOsTraceActivity(m_macTraceActivity);   // the app may nap again
+#endif
         // A name lookup still running for this Start is now stale.
         ++m_startGen;
         // Freeze the duration for the report now, while m_counting still
@@ -2969,6 +3018,10 @@ void MainWindow::onStartStop()
                     self->m_copyBtn->setEnabled(false);
                     self->m_exportBtn->setEnabled(false);
                     self->m_net->DoTrace(self->m_stopSource.get_token(), addr);
+#ifdef Q_OS_MAC
+                    if (!self->m_macTraceActivity)
+                        self->m_macTraceActivity = beginMacOsTraceActivity();
+#endif
                     self->m_refreshTimer->start();
                     self->m_elapsedTimer->start();
                     self->m_warmupTimer->start();
