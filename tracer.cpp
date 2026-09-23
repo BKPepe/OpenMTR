@@ -225,6 +225,10 @@ OpenMTRNet::~OpenMTRNet()
 // Zero the entire hop table so a fresh trace starts from clean statistics.
 void OpenMTRNet::ResetHops()
 {
+    // Under m_mutex like every other write to m_hops: a reader (the UI's
+    // refresh, or a test) may already be taking snapshots when a trace
+    // starts on its worker thread.
+    std::lock_guard<std::mutex> lock(m_mutex);
     memset(m_hops, 0, sizeof(m_hops));
     m_lastAlive.store(0, std::memory_order_relaxed);
     m_parkingEnabled.store(false, std::memory_order_relaxed);
@@ -327,12 +331,19 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     static const sockaddr_in6 srcAny = { AF_INET6, 0, 0, in6addr_any, 0 };
 
     m_isV6 = isV6;
+    {
+        // Under m_mutex like ResetHops() just above: the UI may already be
+        // taking snapshots of the hop table.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (isV6)
+            m_hops[0].addr6.sin6_family = AF_INET6;
+        else
+            m_hops[0].addr.sin_family = AF_INET;
+    }
     if (isV6) {
-        m_hops[0].addr6.sin6_family = AF_INET6;
         last_remote_addr6 = ((sockaddr_in6*)dest)->sin6_addr;
         destAddr6 = *(sockaddr_in6*)dest;
     } else {
-        m_hops[0].addr.sin_family = AF_INET;
         last_remote_addr = ((sockaddr_in*)dest)->sin_addr;
         destAddr4 = ((sockaddr_in*)dest)->sin_addr.s_addr;
     }

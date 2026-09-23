@@ -370,3 +370,12 @@ if(MSVC)
     # that embedded path down to just the bare filename.
     target_link_options(OpenMTR PRIVATE /PDBALTPATH:%_PDB%)
 endif()
+
+# ---- Tests -------------------------------------------------------------------
+# Off by default, so a normal build is unchanged. CI turns it on for macOS in
+# a build directory of its own (see .github/workflows/build.yml).
+option(OPENMTR_BUILD_TESTS "Build the engine tests in tests/" OFF)
+if(OPENMTR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
