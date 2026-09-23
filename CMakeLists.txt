@@ -168,19 +168,32 @@ set_target_properties(OpenMTR PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 # ---- macOS bundle identity & icon ------------------------------------------
 # Without these, CMake's default Info.plist template ships placeholders that
 # users actually see: CFBundleIdentifier "com.yourcompany.OpenMTR" and no
-# Finder/Dock icon at all. The .icns is generated at build time from
-# app_icon.png with the stock sips/iconutil tools (present on every macOS
-# install, including CI runners).
+# Finder/Dock icon at all. The .icns is generated at build time with the
+# stock sips/iconutil tools (present on every macOS install, including CI
+# runners).
 #
-# The full iconset is emitted up to 512@2x (1024 px). app_icon.png is
-# currently a 256 px master, so the entries above it are upscales — the
-# artwork is smooth gradient shapes with no fine detail or text, which
-# survives that far better than a detailed icon would, and macOS otherwise
-# upscales the 256 px entry itself for Launchpad, Get Info and large Finder
-# icon views. Dropping a 1024 px app_icon.png in place makes every size
-# natively crisp with no change here.
+# macOS uses its own master, app_icon_macos.png, and not the app_icon.png the
+# other platforms share. Since macOS 26, an icon whose artwork does not fill
+# the system's rounded-square grid is shrunk and composited onto a grey plate
+# — measured on 27.0, three quarters of what Finder drew for this app was
+# that filler. The macOS master is therefore the same mark laid out on
+# Apple's template (an 824 px body centred in a 1024 px canvas), which the
+# system draws at full size. Windows and Linux keep the free-form glyph,
+# where it is right.
+#
+# The full iconset is emitted up to 512@2x (1024 px) from that 1024 px
+# master. The plate and gradient are drawn at full resolution; the mark on
+# top is still app_icon.png, a 256 px raster, scaled up about 2x to fit the
+# plate — smooth shapes with no fine detail or text, which survive that
+# well. A 1024 px app_icon.png, re-rendered through the SVG below, makes the
+# mark crisp too.
+#
+# packaging/app_icon_macos.svg is the source: `resvg --width 1024
+# --height 1024 packaging/app_icon_macos.svg app_icon_macos.png` (resvg
+# 0.48.1) regenerates the PNG byte for byte. The build itself only needs the
+# PNG, so no new tool is required in CI.
 if(APPLE)
-    set(APP_ICON_SRC "${CMAKE_CURRENT_SOURCE_DIR}/app_icon.png")
+    set(APP_ICON_SRC "${CMAKE_CURRENT_SOURCE_DIR}/app_icon_macos.png")
     set(APP_ICONSET  "${CMAKE_CURRENT_BINARY_DIR}/app_icon.iconset")
     set(APP_ICNS     "${CMAKE_CURRENT_BINARY_DIR}/app_icon.icns")
 
@@ -205,7 +218,7 @@ if(APPLE)
         ${_icns_cmds}
         COMMAND iconutil -c icns "${APP_ICONSET}" -o "${APP_ICNS}"
         DEPENDS "${APP_ICON_SRC}"
-        COMMENT "Generating app_icon.icns from app_icon.png"
+        COMMENT "Generating app_icon.icns from app_icon_macos.png"
         VERBATIM
     )
     target_sources(OpenMTR PRIVATE "${APP_ICNS}")

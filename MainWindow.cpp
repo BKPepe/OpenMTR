@@ -1723,10 +1723,20 @@ void MainWindow::applyFramelessStyle()
     // exists and its real frame geometry is known, so total height (native
     // title bar + content) matches the other platforms instead of just the
     // content alone.
-    if (!isMaximized()) {
+    //
+    // Once, and only once. applyFramelessStyle() also runs from changeEvent()
+    // on every QEvent::WindowStateChange — the Windows branch above returns
+    // early when the style is already applied, but this block had no such
+    // guard, so minimising and restoring, or leaving full screen, re-applied
+    // the startup size and threw away whatever the user had resized the
+    // window to. The correction it makes is a startup adjustment; after that
+    // the window's size belongs to the user.
+    if (!m_macChromeAdjusted && !isMaximized()) {
         const int chromeHeight = frameGeometry().height() - geometry().height();
-        if (chromeHeight > 0)
+        if (chromeHeight > 0) {
+            m_macChromeAdjusted = true;
             resize(1200, 550 - chromeHeight);
+        }
     }
 #endif
 }
@@ -2700,15 +2710,47 @@ void MainWindow::hideIconTooltip()
 //  ASN lookup
 // ==========================================================================
 
+// True for addresses Team Cymru cannot answer for, so the query is skipped.
+// Parsed rather than prefix-matched: the old "172." test threw away the whole
+// of 172/8 when only 172.16/12 is private, hiding Google and Cloudflare, and
+// it missed 100.64/10 in the other direction. inet_pton rather than
+// QHostAddress because that lives in Qt6::Network, which this app does not
+// link.
+static bool isUnroutableForAsn(const QString& ip)
+{
+    const QByteArray raw = ip.toUtf8();
+
+    in_addr v4{};
+    if (inet_pton(AF_INET, raw.constData(), &v4) == 1) {
+        // Explicit cast: ntohl() returns u_long on Windows, and the MSVC
+        // build compiles with /W4 /WX.
+        const uint32_t a = static_cast<uint32_t>(ntohl(v4.s_addr));
+        return (a & 0xFF000000u) == 0x0A000000u   // 10/8
+            || (a & 0xFFF00000u) == 0xAC100000u   // 172.16/12  (NOT all of 172/8)
+            || (a & 0xFFFF0000u) == 0xC0A80000u   // 192.168/16
+            || (a & 0xFF000000u) == 0x7F000000u   // 127/8 loopback
+            || (a & 0xFFFF0000u) == 0xA9FE0000u   // 169.254/16 link-local
+            || (a & 0xFFC00000u) == 0x64400000u   // 100.64/10 CGNAT
+            || a == 0u;                           // 0.0.0.0
+    }
+
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, raw.constData(), &v6) == 1) {
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(&v6);
+        if ((b[0] & 0xFE) == 0xFC) return true;                  // fc00::/7 ULA
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true;  // fe80::/10 link-local
+        for (int i = 0; i < 16; ++i) if (b[i]) return false;
+        return true;                                             // ::
+    }
+
+    return true;   // not an address we can query for
+}
+
 // Resolve an IP to its ASN via Team Cymru's DNS service. Skips private and
 // link-local ranges. Blocking — must be called off the UI thread.
 QString MainWindow::lookupASN(const QString& ip, bool ipv6)
 {
-    if (ip.isEmpty() || ip == "0.0.0.0" || ip == "::"
-        || ip.startsWith("192.168.") || ip.startsWith("10.")
-        || ip.startsWith("172.")     || ip.startsWith("127.")
-        || ip.startsWith("169.254")  || ip.startsWith("fe80")
-        || ip.startsWith("fc")       || ip.startsWith("fd"))
+    if (ip.isEmpty() || isUnroutableForAsn(ip))
         return QString();
 
     QString query;
@@ -3339,13 +3381,67 @@ void MainWindow::onCopy()
     m_copyFeedbackTimer.start();
 }
 
+#ifndef Q_OS_WIN
+// Where the Save dialog should open. Documents until the user saves
+// somewhere, then that place for the rest of the session. Deliberately not
+// persisted: the app keeps no settings at all, and adding a settings file for
+// this one string is not worth it.
+//
+// Guarded: the Windows branch of onExport() drives GetSaveFileNameW, which
+// has the shell's own most-recently-used behaviour and never calls these.
+// Unguarded they would be unreferenced statics there, and the MSVC build
+// turns C4505 into an error via /WX.
+static QString& lastExportDir()
+{
+    static QString dir;
+    return dir;
+}
+
+static QString exportDirectory()
+{
+    QString& remembered = lastExportDir();
+    if (!remembered.isEmpty() && QDir(remembered).exists())
+        return remembered;
+    const QString docs = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    if (!docs.isEmpty() && QDir(docs).exists())
+        return docs;
+    return QDir::homePath();
+}
+
+static void rememberExportDirectory(const QString& chosenFilePath)
+{
+    const QString dir = QFileInfo(chosenFilePath).absolutePath();
+    if (!dir.isEmpty())
+        lastExportDir() = dir;
+}
+#endif  // !Q_OS_WIN
+
+// A target becomes part of the export's file name, so replace what a file
+// name cannot hold with '-' — every IPv6 literal contains ':', illegal on
+// Windows and still the separator Finder shows on macOS. '%' is left alone:
+// it is legal everywhere, so a zone id survives. The cap keeps a long
+// hostname (up to 253 chars) from pushing prefix + target + timestamp past
+// the 255-byte limit; 64 leaves any IP literal untouched.
+static QString sanitizeForFilename(QString target)
+{
+    target.replace(QRegularExpression(QStringLiteral(R"([<>:"/\\|?*\x00-\x1f])")),
+                   QStringLiteral("-"));
+    if (target.size() > 64) {
+        // Don't cut between the two halves of a surrogate pair.
+        const int cut = target.at(63).isHighSurrogate() ? 63 : 64;
+        target.truncate(cut);
+    }
+    return target;
+}
+
 // Save the report via the native Save dialog, as .txt (ASCII box) or .csv.
 void MainWindow::onExport()
 {
     if (!m_exportBtn->isEnabled()) return;
     QString target = m_targetEdit->text().trimmed();
     QString stamp  = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    QString defaultName = QString("OpenMTR_%1_%2").arg(target.isEmpty() ? "export" : target, stamp);
+    const QString safeTarget = sanitizeForFilename(target);
+    QString defaultName = QString("OpenMTR_%1_%2").arg(safeTarget.isEmpty() ? "export" : safeTarget, stamp);
 
 #ifdef Q_OS_WIN
     wchar_t fileBuf[MAX_PATH] = {};
@@ -3389,8 +3485,14 @@ void MainWindow::onExport()
         tr("All files (*.*)")
     };
     QString selectedFilter = macFilters.first();
+    // An absolute path, not a bare file name. Qt resolves a relative one
+    // against QDir::current(), and an app launched from Finder, the Dock or
+    // `open` has "/" as its working directory — so the panel opened on the
+    // read-only system volume every time. Documents is the starting point;
+    // after the first export the panel returns to wherever the user last
+    // saved, for as long as the app is running.
     QString path = QFileDialog::getSaveFileName(
-        this, tr("Export results"), defaultName,
+        this, tr("Export results"), QDir(exportDirectory()).filePath(defaultName),
         macFilters.join(QStringLiteral(";;")), &selectedFilter);
     if (path.isEmpty()) return;
 
@@ -3449,6 +3551,10 @@ void MainWindow::onExport()
         tr("JSON files (*.json)"),
         tr("All files (*.*)")
     });
+    // Same reasoning as the macOS branch: point the dialog at a real
+    // directory instead of letting a bare name resolve against the process
+    // working directory, which is "/" for a desktop-launched app.
+    dialog.setDirectory(exportDirectory());
     dialog.selectFile(defaultName);
     if (!dialog.exec()) return;
 
@@ -3468,6 +3574,11 @@ void MainWindow::onExport()
         MicaDialog::show(this, "OpenMTR", QString("Could not write to \"%1\".").arg(path), m_darkMode);
         return;
     }
+#ifndef Q_OS_WIN
+    // Only a directory the export could actually be written to is worth
+    // coming back to.
+    rememberExportDirectory(path);
+#endif
     QTextStream ts(&f);
     if (path.endsWith(".json", Qt::CaseInsensitive)) {
         ts << buildJsonExport();
