@@ -155,9 +155,10 @@ typedef struct
 // Based well clear of the IP_STATUS range rather than tacked onto its end:
 // Microsoft owns 11000-11050 (plus IP_PENDING at 11255) and may extend it,
 // and borrowing the next free number would quietly squat on that. Outside
-// the platform split above, because SetErrorName() renders every status in
-// one switch that both platforms compile, even though only the POSIX
-// dispatch loop produces these.
+// the platform split above, because OpenMTRStatusText() (used by
+// SetErrorName() and by MainWindow) renders every status in one switch that
+// both platforms compile, even though only the POSIX dispatch loop produces
+// these.
 #define OPENMTR_STATUS_BASE        12000
 
 // The probe never left this machine: sendto()/setsockopt() failed locally.
@@ -170,6 +171,13 @@ typedef struct
 #define OPENMTR_NOT_SENT_NO_BUFFERS  (OPENMTR_STATUS_BASE + 4)
 #define OPENMTR_NOT_SENT_REFUSED     (OPENMTR_STATUS_BASE + 5)
 #define OPENMTR_NOT_SENT_OTHER       (OPENMTR_STATUS_BASE + 6)
+
+// The sentence for an IP_* or OPENMTR_* status, e.g. "Destination host
+// unreachable." — "Unknown error." for a number it does not know. `ipv6` is
+// the family of the trace the status came from: Windows reports ICMPv6
+// errors with the same numbers as ICMPv4, and one of them means something
+// else there.
+const char* OpenMTRStatusText(unsigned long status, bool ipv6);
 
 // C++ standard library.
 #include <mutex>
@@ -337,9 +345,14 @@ public:
 
     // Shared state read across threads: live flags, last target, handles.
     // Cross-thread flags: `tracing` is written by Stop/DoTrace and polled
-    // once per dispatch-loop pass; the other two are written once during
-    // construction.
+    // once per dispatch-loop pass; `stopRequested` is set by StopTrace() and
+    // never cleared; the other two are written once during construction.
     std::atomic<bool> tracing{false};
+    // Sticky, unlike `tracing`: a stop that lands before DoTrace() has
+    // started must still win, and DoTrace() itself sets `tracing` to true.
+    // An engine runs one trace (OpenMTRNetWrapper makes a new one each time),
+    // so there is nothing to clear it for.
+    std::atomic<bool> stopRequested{false};
     std::atomic<bool> hasIPv6{false};
     std::atomic<bool> initialized{false};
 

@@ -2343,6 +2343,9 @@ private:
     // one-time startup adjustment, so it must not re-run on later window
     // state changes and overwrite a size the user chose. See there.
     bool    m_macChromeAdjusted = false;
+    // NSProcessInfo activity held from a trace's start to its Stop, so App
+    // Nap cannot throttle the measurement (see beginMacOsTraceActivity()).
+    void*   m_macTraceActivity = nullptr;
 #endif
     QTimer* m_refreshTimer = nullptr;
     QTimer* m_elapsedTimer = nullptr;
@@ -2363,6 +2366,22 @@ private:
     // built well after the test actually stopped.
     QDateTime m_testStartTime;
     qint64    m_testDurationMs = 0;
+    // Address family of the trace in the table, for describing its statuses —
+    // also in a report made after Stop, when the IPv6 checkbox is editable
+    // again and may no longer match.
+    bool      m_traceIsV6 = false;
+    // The engine's last snapshot, taken at Stop. The engine itself is gone
+    // then, but the table stays and Copy/Export stay enabled, so the report's
+    // Notes (alternate responders, error statuses) come from here.
+    std::vector<OpenMTRHostInfo> m_finalState;
+    // The target as typed when the trace in the table was started. Copy and
+    // Export label the report with this, not with the input field, which the
+    // user may have edited since (it is editable again once a trace stops).
+    QString   m_reportTarget;
+    // Bumped by every Start and every Stop. A name lookup carries the value
+    // its Start got, and its result is ignored once that is no longer
+    // current (see onStartStop()).
+    quint64   m_startGen = 0;
     mutable std::unordered_map<std::string, QString> m_asnCache;
     mutable std::unordered_set<std::string>           m_asnPending;
     bool    m_keyboardFocus = false;

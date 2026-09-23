@@ -94,6 +94,25 @@ static DWORD Icmp6StatusFor(uint8_t type, uint8_t code)
     }
 }
 
+// The IPv4 counterpart of Icmp6StatusFor(). Both receive paths use it — the
+// recvfrom() one and Linux's error queue — which used to carry a copy each
+// and had drifted apart (only the error-queue copy knew "fragmentation
+// needed"). RFC 792 numbering: type 3 = Destination Unreachable, code 0 net,
+// 2 protocol, 3 port, 4 fragmentation needed and DF set. Anything else falls
+// back to host unreachable, as both copies did.
+static DWORD Icmp4StatusFor(uint8_t type, uint8_t code)
+{
+    if (type != ICMP_UNREACH)
+        return IP_DEST_HOST_UNREACHABLE;
+    switch (code) {
+    case ICMP_UNREACH_NET:      return IP_DEST_NET_UNREACHABLE;
+    case ICMP_UNREACH_PROTOCOL: return IP_DEST_PROT_UNREACHABLE;
+    case ICMP_UNREACH_PORT:     return IP_DEST_PORT_UNREACHABLE;
+    case ICMP_UNREACH_NEEDFRAG: return IP_PACKET_TOO_BIG;
+    default:                    return IP_DEST_HOST_UNREACHABLE;
+    }
+}
+
 // Translate a local send failure's errno into one of OpenMTR's "Not sent"
 // codes, so a trace that never left the machine says so — and says why —
 // instead of "General failure." on every row, and without borrowing the
@@ -225,6 +244,10 @@ OpenMTRNet::~OpenMTRNet()
 // Zero the entire hop table so a fresh trace starts from clean statistics.
 void OpenMTRNet::ResetHops()
 {
+    // Under m_mutex like every other write to m_hops: a reader (the UI's
+    // refresh, or a test) may already be taking snapshots when a trace
+    // starts on its worker thread.
+    std::lock_guard<std::mutex> lock(m_mutex);
     memset(m_hops, 0, sizeof(m_hops));
     m_lastAlive.store(0, std::memory_order_relaxed);
     m_parkingEnabled.store(false, std::memory_order_relaxed);
@@ -303,9 +326,18 @@ struct HopState {
 #ifdef _WIN32
 void OpenMTRNet::DoTrace(sockaddr* dest)
 {
-    tracing = true;
     ResetHops();
     if (m_stopEvent) ResetEvent(m_stopEvent);
+    // Set `tracing` first, then look for a stop. StopTrace() does the same
+    // two steps the other way round (stopRequested, then tracing = false),
+    // so whichever side runs first, the trace ends: either we see the
+    // request here, or its `tracing = false` lands after ours. A stop that
+    // arrived before the ResetEvent() above is caught here too.
+    tracing = true;
+    if (stopRequested) {
+        tracing = false;
+        return;
+    }
 
     const bool isV6       = (dest->sa_family == AF_INET6);
     const WORD payloadLen = (WORD)opts.pingsize;
@@ -327,12 +359,19 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     static const sockaddr_in6 srcAny = { AF_INET6, 0, 0, in6addr_any, 0 };
 
     m_isV6 = isV6;
+    {
+        // Under m_mutex like ResetHops() just above: the UI may already be
+        // taking snapshots of the hop table.
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (isV6)
+            m_hops[0].addr6.sin6_family = AF_INET6;
+        else
+            m_hops[0].addr.sin_family = AF_INET;
+    }
     if (isV6) {
-        m_hops[0].addr6.sin6_family = AF_INET6;
         last_remote_addr6 = ((sockaddr_in6*)dest)->sin6_addr;
         destAddr6 = *(sockaddr_in6*)dest;
     } else {
-        m_hops[0].addr.sin_family = AF_INET;
         last_remote_addr = ((sockaddr_in*)dest)->sin_addr;
         destAddr4 = ((sockaddr_in*)dest)->sin_addr.s_addr;
     }
@@ -539,13 +578,20 @@ static uint16_t calculate_checksum(const uint16_t* addr, int count)
 // poll() instead of IcmpSendEcho2()/WaitForMultipleObjects().
 void OpenMTRNet::DoTrace(sockaddr* dest)
 {
-    tracing = true;
     ResetHops();
 
     // Drain any stale wake-ups left over from a previous trace.
     if (m_stopPipe[0] != -1) {
         char dummy[128];
         while (::read(m_stopPipe[0], dummy, sizeof(dummy)) > 0) {}
+    }
+
+    // Same order as the Windows DoTrace() above, and for the same reason: a
+    // stop whose wake-up byte the drain just ate is still seen here.
+    tracing = true;
+    if (stopRequested) {
+        tracing = false;
+        return;
     }
 
     const bool isV6      = (dest->sa_family == AF_INET6);
@@ -606,6 +652,16 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         tracing = false;
         return;
     }
+
+#ifdef __APPLE__
+    // Room for the largest reply. macOS gives an ICMP socket an 8 KB receive
+    // buffer (net.inet.raw.recvspace = 8192), and an echo reply to a probe
+    // of about 8133 bytes or more does not fit in it with its overhead, so
+    // the kernel dropped it and every probe at those ping sizes timed out.
+    // A refusal is not fatal: everything else works as before.
+    int rcvbuf = 64 * 1024;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+#endif
 
 #ifdef __linux__
     // Linux ping sockets don't hand ICMP error messages (Time Exceeded,
@@ -1004,12 +1060,8 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                                     RecordProbe(hopIndex, true, rtt);
                                     SetAddr(hopIndex, from_in->sin_addr.s_addr);
                                 } else {
-                                    DWORD errStatus = IP_DEST_HOST_UNREACHABLE;
-                                    if (icmp->icmp_type == ICMP_UNREACH) {
-                                        if      (icmp->icmp_code == ICMP_UNREACH_NET)      errStatus = IP_DEST_NET_UNREACHABLE;
-                                        else if (icmp->icmp_code == ICMP_UNREACH_PORT)     errStatus = IP_DEST_PORT_UNREACHABLE;
-                                        else if (icmp->icmp_code == ICMP_UNREACH_PROTOCOL) errStatus = IP_DEST_PROT_UNREACHABLE;
-                                    }
+                                    const DWORD errStatus =
+                                        Icmp4StatusFor(icmp->icmp_type, icmp->icmp_code);
                                     SetErrorName(hopIndex, errStatus);
                                     RecordProbe(hopIndex, false, 0, errStatus);
                                 }
@@ -1185,15 +1237,8 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                     // The error queue reports the same ICMP type/code the
                     // packet carried, so both families map exactly as they
                     // do on the recvfrom path above.
-                    DWORD errStatus = IP_DEST_HOST_UNREACHABLE;
-                    if (isV6) {
-                        errStatus = Icmp6StatusFor(ee->ee_type, ee->ee_code);
-                    } else if (ee->ee_type == ICMP_UNREACH) {
-                        if      (ee->ee_code == ICMP_UNREACH_NET)      errStatus = IP_DEST_NET_UNREACHABLE;
-                        else if (ee->ee_code == ICMP_UNREACH_PORT)     errStatus = IP_DEST_PORT_UNREACHABLE;
-                        else if (ee->ee_code == ICMP_UNREACH_PROTOCOL) errStatus = IP_DEST_PROT_UNREACHABLE;
-                        else if (ee->ee_code == ICMP_UNREACH_NEEDFRAG) errStatus = IP_PACKET_TOO_BIG;
-                    }
+                    const DWORD errStatus = isV6 ? Icmp6StatusFor(ee->ee_type, ee->ee_code)
+                                                 : Icmp4StatusFor(ee->ee_type, ee->ee_code);
                     SetErrorName(hopIndex, errStatus);
                     RecordProbe(hopIndex, false, 0, errStatus);
                 }
@@ -1213,6 +1258,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
 // wait out its current timeout slice.
 void OpenMTRNet::StopTrace()
 {
+    stopRequested = true;     // before `tracing` — see DoTrace()
     tracing = false;
 #ifdef _WIN32
     if (m_stopEvent) SetEvent(m_stopEvent);
@@ -1502,6 +1548,50 @@ static bool IsLocalStatus(DWORD st)
         && st <= static_cast<DWORD>(OPENMTR_NOT_SENT_OTHER);
 }
 
+// The sentence for a status code: what the Hostname column shows for a hop
+// that has no name, and what the tooltip and the export print next to the
+// number (see tracer.h).
+const char* OpenMTRStatusText(unsigned long status, bool ipv6)
+{
+    // ipexport.h gives the ICMPv6 statuses the IPv4 numbers: 11002 is also
+    // IP_DEST_NO_ROUTE, 11003 IP_DEST_ADDR_UNREACHABLE, 11014-11015 the
+    // IPv6 reassembly-time-exceeded and parameter-problem codes, all close
+    // enough to the IPv4 sentence (11013, hop limit exceeded, is a normal
+    // reply and never gets here). 11004 is not: for IPv6 it is IP_DEST_PROHIBITED
+    // (ICMPv6 has no "protocol unreachable"). Only the Windows engine can
+    // produce it for an IPv6 trace; the POSIX one reports that ICMPv6 code
+    // as IP_BAD_ROUTE.
+    if (ipv6 && status == IP_DEST_PROT_UNREACHABLE)
+        return "Communication administratively prohibited.";
+    switch (status) {
+    case IP_BUF_TOO_SMALL:            return "Reply buffer too small.";
+    case IP_DEST_NET_UNREACHABLE:     return "Destination network unreachable.";
+    case IP_DEST_HOST_UNREACHABLE:    return "Destination host unreachable.";
+    case IP_DEST_PROT_UNREACHABLE:    return "Destination protocol unreachable.";
+    case IP_DEST_PORT_UNREACHABLE:    return "Destination port unreachable.";
+    case IP_NO_RESOURCES:             return "Insufficient IP resources.";
+    case IP_BAD_OPTION:               return "Bad IP option.";
+    case IP_HW_ERROR:                 return "Hardware error.";
+    case IP_PACKET_TOO_BIG:           return "Packet too big.";
+    case IP_REQ_TIMED_OUT:            return "Request timed out.";
+    case IP_BAD_REQ:                  return "Bad request.";
+    case IP_BAD_ROUTE:                return "Bad route.";
+    case IP_TTL_EXPIRED_REASSEM:      return "TTL expired during reassembly.";
+    case IP_PARAM_PROBLEM:            return "Parameter problem.";
+    case IP_SOURCE_QUENCH:            return "Source quench.";
+    case IP_OPTION_TOO_BIG:           return "IP option too big.";
+    case IP_BAD_DESTINATION:          return "Bad destination.";
+    case IP_GENERAL_FAILURE:          return "General failure.";
+    case OPENMTR_NOT_SENT_NO_ROUTE:   return "Not sent: no route from this machine.";
+    case OPENMTR_NOT_SENT_NO_ADDRESS: return "Not sent: no usable local address.";
+    case OPENMTR_NOT_SENT_TOO_BIG:    return "Not sent: probe too large.";
+    case OPENMTR_NOT_SENT_NO_BUFFERS: return "Not sent: out of buffer space.";
+    case OPENMTR_NOT_SENT_REFUSED:    return "Not sent: refused by this machine.";
+    case OPENMTR_NOT_SENT_OTHER:      return "Not sent: local error.";
+    default:                          return "Unknown error.";
+    }
+}
+
 // Translate a status code into readable text. Only applied when the hop has
 // no name yet, so a real host name always wins — with one exception: a
 // "Not sent" text is provisional. A burst of local failures (IPv6 dropping
@@ -1509,34 +1599,7 @@ static bool IsLocalStatus(DWORD st)
 // trace; the next non-local status replaces it instead.
 void OpenMTRNet::SetErrorName(int at, DWORD errnum)
 {
-    const char* name;
-    switch (errnum) {
-    case IP_BUF_TOO_SMALL:            name = "Reply buffer too small."; break;
-    case IP_DEST_NET_UNREACHABLE:     name = "Destination network unreachable."; break;
-    case IP_DEST_HOST_UNREACHABLE:    name = "Destination host unreachable."; break;
-    case IP_DEST_PROT_UNREACHABLE:    name = "Destination protocol unreachable."; break;
-    case IP_DEST_PORT_UNREACHABLE:    name = "Destination port unreachable."; break;
-    case IP_NO_RESOURCES:             name = "Insufficient IP resources."; break;
-    case IP_BAD_OPTION:               name = "Bad IP option."; break;
-    case IP_HW_ERROR:                 name = "Hardware error."; break;
-    case IP_PACKET_TOO_BIG:           name = "Packet too big."; break;
-    case IP_REQ_TIMED_OUT:            name = "Request timed out."; break;
-    case IP_BAD_REQ:                  name = "Bad request."; break;
-    case IP_BAD_ROUTE:                name = "Bad route."; break;
-    case IP_TTL_EXPIRED_REASSEM:      name = "TTL expired during reassembly."; break;
-    case IP_PARAM_PROBLEM:            name = "Parameter problem."; break;
-    case IP_SOURCE_QUENCH:            name = "Source quench."; break;
-    case IP_OPTION_TOO_BIG:           name = "IP option too big."; break;
-    case IP_BAD_DESTINATION:          name = "Bad destination."; break;
-    case IP_GENERAL_FAILURE:          name = "General failure."; break;
-    case OPENMTR_NOT_SENT_NO_ROUTE:   name = "Not sent: no route from this machine."; break;
-    case OPENMTR_NOT_SENT_NO_ADDRESS: name = "Not sent: no usable local address."; break;
-    case OPENMTR_NOT_SENT_TOO_BIG:    name = "Not sent: probe too large."; break;
-    case OPENMTR_NOT_SENT_NO_BUFFERS: name = "Not sent: out of buffer space."; break;
-    case OPENMTR_NOT_SENT_REFUSED:    name = "Not sent: refused by this machine."; break;
-    case OPENMTR_NOT_SENT_OTHER:      name = "Not sent: local error."; break;
-    default:                          name = "Unknown error."; break;
-    }
+    const char* name = OpenMTRStatusText(errnum, m_isV6);
     const bool local = IsLocalStatus(errnum);
     std::lock_guard<std::mutex> lock(m_mutex);
     HopRecord& h = m_hops[at];

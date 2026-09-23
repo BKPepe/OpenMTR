@@ -276,6 +276,19 @@ jobs:
             -DCMAKE_PREFIX_PATH="$HOME/qt-macos-static"
           cmake --build build --parallel
 
+      - name: Engine tests
+        # tracer.cpp on its own (tests/): no window, and nothing is sent off
+        # the runner. dns_lifetime is the use-after-free 1.3.0 shipped after
+        # its fix was lost in an upload; against that tree it aborts or
+        # hangs. A build directory of its own, so the app above is untouched.
+        run: |
+          cmake -S . -B build-tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$HOME/qt-macos-static" \
+            -DOPENMTR_BUILD_TESTS=ON
+          cmake --build build-tests --target engine_tests --parallel
+          ctest --test-dir build-tests --output-on-failure --no-tests=error
+
       - name: Ad-hoc sign
         # One binary, no nested code — a single codesign is the whole
         # inside-out order now.
