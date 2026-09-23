@@ -2371,6 +2371,10 @@ private:
     // then, but the table stays and Copy/Export stay enabled, so the report's
     // Notes (alternate responders, error statuses) come from here.
     std::vector<OpenMTRHostInfo> m_finalState;
+    // The target as typed when the trace in the table was started. Copy and
+    // Export label the report with this, not with the input field, which the
+    // user may have edited since (it is editable again once a trace stops).
+    QString   m_reportTarget;
     mutable std::unordered_map<std::string, QString> m_asnCache;
     mutable std::unordered_set<std::string>           m_asnPending;
     bool    m_keyboardFocus = false;

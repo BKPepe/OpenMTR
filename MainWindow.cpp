@@ -2952,6 +2952,7 @@ void MainWindow::onStartStop()
                     self->m_net      = net;
                     self->m_traceIsV6 = ipv6;
                     self->m_finalState.clear();
+                    self->m_reportTarget = target;
                     self->m_counting = false;
                     self->m_testStartTime = QDateTime();
                     self->m_testDurationMs = 0;
@@ -3299,7 +3300,7 @@ QString MainWindow::buildJsonExport() const
         hops.append(o);
     }
     QJsonObject root;
-    root["target"]          = m_targetEdit->text().trimmed();
+    root["target"]          = m_reportTarget;
     // Wall-clock time the counting window began (falls back to "now" if
     // somehow queried before that, though Copy/Export stay disabled until
     // then in practice) and how long it has run — see currentTestDurationMs().
@@ -3314,7 +3315,7 @@ QString MainWindow::buildJsonExport() const
 // sizing each column to its actual content.
 QString MainWindow::buildTextExport() const
 {
-    QString target = m_targetEdit->text().trimmed();
+    const QString& target = m_reportTarget;
     const int NCOLS = static_cast<int>(COLUMNS.size());
     std::vector<int> W(NCOLS);
     for (int c = 0; c < NCOLS; ++c) {
@@ -3455,9 +3456,8 @@ static QString sanitizeForFilename(QString target)
 void MainWindow::onExport()
 {
     if (!m_exportBtn->isEnabled()) return;
-    QString target = m_targetEdit->text().trimmed();
     QString stamp  = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    const QString safeTarget = sanitizeForFilename(target);
+    const QString safeTarget = sanitizeForFilename(m_reportTarget);
     QString defaultName = QString("OpenMTR_%1_%2").arg(safeTarget.isEmpty() ? "export" : safeTarget, stamp);
 
 #ifdef Q_OS_WIN
