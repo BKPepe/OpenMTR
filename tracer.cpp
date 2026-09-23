@@ -94,6 +94,25 @@ static DWORD Icmp6StatusFor(uint8_t type, uint8_t code)
     }
 }
 
+// The IPv4 counterpart of Icmp6StatusFor(). Both receive paths use it — the
+// recvfrom() one and Linux's error queue — which used to carry a copy each
+// and had drifted apart (only the error-queue copy knew "fragmentation
+// needed"). RFC 792 numbering: type 3 = Destination Unreachable, code 0 net,
+// 2 protocol, 3 port, 4 fragmentation needed and DF set. Anything else falls
+// back to host unreachable, as both copies did.
+static DWORD Icmp4StatusFor(uint8_t type, uint8_t code)
+{
+    if (type != ICMP_UNREACH)
+        return IP_DEST_HOST_UNREACHABLE;
+    switch (code) {
+    case ICMP_UNREACH_NET:      return IP_DEST_NET_UNREACHABLE;
+    case ICMP_UNREACH_PROTOCOL: return IP_DEST_PROT_UNREACHABLE;
+    case ICMP_UNREACH_PORT:     return IP_DEST_PORT_UNREACHABLE;
+    case ICMP_UNREACH_NEEDFRAG: return IP_PACKET_TOO_BIG;
+    default:                    return IP_DEST_HOST_UNREACHABLE;
+    }
+}
+
 // Translate a local send failure's errno into one of OpenMTR's "Not sent"
 // codes, so a trace that never left the machine says so — and says why —
 // instead of "General failure." on every row, and without borrowing the
@@ -1031,12 +1050,8 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                                     RecordProbe(hopIndex, true, rtt);
                                     SetAddr(hopIndex, from_in->sin_addr.s_addr);
                                 } else {
-                                    DWORD errStatus = IP_DEST_HOST_UNREACHABLE;
-                                    if (icmp->icmp_type == ICMP_UNREACH) {
-                                        if      (icmp->icmp_code == ICMP_UNREACH_NET)      errStatus = IP_DEST_NET_UNREACHABLE;
-                                        else if (icmp->icmp_code == ICMP_UNREACH_PORT)     errStatus = IP_DEST_PORT_UNREACHABLE;
-                                        else if (icmp->icmp_code == ICMP_UNREACH_PROTOCOL) errStatus = IP_DEST_PROT_UNREACHABLE;
-                                    }
+                                    const DWORD errStatus =
+                                        Icmp4StatusFor(icmp->icmp_type, icmp->icmp_code);
                                     SetErrorName(hopIndex, errStatus);
                                     RecordProbe(hopIndex, false, 0, errStatus);
                                 }
@@ -1212,15 +1227,8 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                     // The error queue reports the same ICMP type/code the
                     // packet carried, so both families map exactly as they
                     // do on the recvfrom path above.
-                    DWORD errStatus = IP_DEST_HOST_UNREACHABLE;
-                    if (isV6) {
-                        errStatus = Icmp6StatusFor(ee->ee_type, ee->ee_code);
-                    } else if (ee->ee_type == ICMP_UNREACH) {
-                        if      (ee->ee_code == ICMP_UNREACH_NET)      errStatus = IP_DEST_NET_UNREACHABLE;
-                        else if (ee->ee_code == ICMP_UNREACH_PORT)     errStatus = IP_DEST_PORT_UNREACHABLE;
-                        else if (ee->ee_code == ICMP_UNREACH_PROTOCOL) errStatus = IP_DEST_PROT_UNREACHABLE;
-                        else if (ee->ee_code == ICMP_UNREACH_NEEDFRAG) errStatus = IP_PACKET_TOO_BIG;
-                    }
+                    const DWORD errStatus = isV6 ? Icmp6StatusFor(ee->ee_type, ee->ee_code)
+                                                 : Icmp4StatusFor(ee->ee_type, ee->ee_code);
                     SetErrorName(hopIndex, errStatus);
                     RecordProbe(hopIndex, false, 0, errStatus);
                 }
