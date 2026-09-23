@@ -127,11 +127,18 @@ typedef struct
 #define IP_REQ_TIMED_OUT          11010
 #define IP_BAD_REQ                11011
 #define IP_BAD_ROUTE              11012
-#define IP_TTL_EXPIRED_REASSEM    11013
-#define IP_PARAM_PROBLEM          11014
-#define IP_SOURCE_QUENCH          11015
-#define IP_OPTION_TOO_BIG         11016
-#define IP_BAD_DESTINATION        11017
+// IP_TTL_EXPIRED_TRANSIT is what a Time Exceeded in transit maps to on
+// Windows. The POSIX engine never produces it (a hop that answers with one is
+// a normal reply, not an anomaly), but it has to occupy 11013 anyway so the
+// values below stay the SDK's: MainWindow prints the raw number into the hop
+// tooltip and the export. (Windows itself reuses some of these numbers with
+// IPv6 meanings, so an IPv6 number is only comparable within one platform.)
+#define IP_TTL_EXPIRED_TRANSIT    11013
+#define IP_TTL_EXPIRED_REASSEM    11014
+#define IP_PARAM_PROBLEM          11015
+#define IP_SOURCE_QUENCH          11016
+#define IP_OPTION_TOO_BIG         11017
+#define IP_BAD_DESTINATION        11018
 #define IP_GENERAL_FAILURE        11050
 
 // System-menu command IDs (winuser.h) — used by MainWindow's custom title
@@ -142,6 +149,27 @@ typedef struct
 #define SC_RESTORE  0xF120
 #define SC_CLOSE    0xF060
 #endif
+
+// OpenMTR's own status codes, for conditions Windows has no IP_STATUS for.
+//
+// Based well clear of the IP_STATUS range rather than tacked onto its end:
+// Microsoft owns 11000-11050 (plus IP_PENDING at 11255) and may extend it,
+// and borrowing the next free number would quietly squat on that. Outside
+// the platform split above, because SetErrorName() renders every status in
+// one switch that both platforms compile, even though only the POSIX
+// dispatch loop produces these.
+#define OPENMTR_STATUS_BASE        12000
+
+// The probe never left this machine: sendto()/setsockopt() failed locally.
+// Kept apart from the IP_* codes on purpose — a router's "destination host
+// unreachable" and this machine having no route are different problems and
+// must not look alike in the table, the tooltip or the export.
+#define OPENMTR_NOT_SENT_NO_ROUTE    (OPENMTR_STATUS_BASE + 1)
+#define OPENMTR_NOT_SENT_NO_ADDRESS  (OPENMTR_STATUS_BASE + 2)
+#define OPENMTR_NOT_SENT_TOO_BIG     (OPENMTR_STATUS_BASE + 3)
+#define OPENMTR_NOT_SENT_NO_BUFFERS  (OPENMTR_STATUS_BASE + 4)
+#define OPENMTR_NOT_SENT_REFUSED     (OPENMTR_STATUS_BASE + 5)
+#define OPENMTR_NOT_SENT_OTHER       (OPENMTR_STATUS_BASE + 6)
 
 // C++ standard library.
 #include <mutex>
@@ -205,6 +233,8 @@ struct HopRecord {
                                // nor a plain timeout (non-success ICMP status
                                // in a reply, or a soft failure of the call)
     unsigned long anomalyLast;     // most recent such status / error code
+    bool          nameIsLocal;     // `name` holds a "Not sent: ..." text, which
+                                   // a later real status or name may replace
     unsigned long total;
     unsigned long jitterSum;   // sum of |RTT - previous RTT| over consecutive replies
     int           last;

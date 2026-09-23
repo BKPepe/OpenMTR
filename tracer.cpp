@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <cerrno>
 #include <chrono>
 
 // Windows CRT helpers used throughout this file, backed by their POSIX
@@ -90,6 +91,33 @@ static DWORD Icmp6StatusFor(uint8_t type, uint8_t code)
         }
     default:
         return IP_GENERAL_FAILURE;
+    }
+}
+
+// Translate a local send failure's errno into one of OpenMTR's "Not sent"
+// codes, so a trace that never left the machine says so — and says why —
+// instead of "General failure." on every row, and without borrowing the
+// wording a router uses for its own ICMP errors.
+static DWORD SendStatusFor(int err)
+{
+    switch (err) {
+    case EHOSTUNREACH:      // the common IPv6-is-down case
+    case ENETUNREACH:
+    case ENETDOWN:          // the interface went away mid-trace
+    case EHOSTDOWN:         // on-link next hop did not answer ARP/NDP
+        return OPENMTR_NOT_SENT_NO_ROUTE;
+    case EADDRNOTAVAIL:     // no usable source address of that family
+        return OPENMTR_NOT_SENT_NO_ADDRESS;
+    case EMSGSIZE:          // probe exceeds the socket/interface limit
+        return OPENMTR_NOT_SENT_TOO_BIG;
+    case ENOBUFS:
+    case ENOMEM:
+        return OPENMTR_NOT_SENT_NO_BUFFERS;
+    case EACCES:
+    case EPERM:             // e.g. a local packet-filter rule
+        return OPENMTR_NOT_SENT_REFUSED;
+    default:
+        return OPENMTR_NOT_SENT_OTHER;
     }
 }
 #endif
@@ -621,6 +649,25 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         hs.slot = 0;
     }
 
+    // sendto() for a probe. On Linux a ping socket with IP_RECVERR also keeps
+    // the last ICMP error it queued in sk_err — a router's Time Exceeded
+    // included — and the next send returns that error instead of sending
+    // (sock_alloc_send_pskb() in net/core/sock.c). A failed send there can
+    // therefore be a router's answer to an earlier probe rather than a
+    // problem on this machine, and it would be reported as "Not sent". The
+    // failed call has cleared sk_err, so one immediate retry tells the two
+    // apart: a real local failure fails again, and the router's entry stays
+    // in the error queue for the drain below.
+    auto sendProbe = [&](const std::vector<unsigned char>& pkt,
+                         const sockaddr* to, socklen_t toLen) -> ssize_t {
+        ssize_t sent = ::sendto(fd, pkt.data(), pkt.size(), 0, to, toLen);
+#ifdef __linux__
+        if (sent < 0)
+            sent = ::sendto(fd, pkt.data(), pkt.size(), 0, to, toLen);
+#endif
+        return sent;
+    };
+
     // Send one probe for a hop. The sequence number packs the hop index into
     // its top five bits so a reply can be matched back to its hop without
     // any extra per-hop state travelling over the wire (see the reply
@@ -644,8 +691,9 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
             // hop's TTL, so the reply would be filed against the wrong row.
             // Count it as a failed probe instead of quietly mismeasuring.
             if (::setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, sizeof(val)) < 0) {
-                SetErrorName(hs.ttl - 1, IP_GENERAL_FAILURE);
-                RecordProbe(hs.ttl - 1, false, 0, IP_GENERAL_FAILURE);
+                const DWORD st = SendStatusFor(errno);
+                SetErrorName(hs.ttl - 1, st);
+                RecordProbe(hs.ttl - 1, false, 0, st);
                 hs.pending = false;
                 return;
             }
@@ -660,19 +708,20 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
             std::vector<unsigned char> pkt(sizeof(struct icmp6_hdr) + payloadLen, ' ');
             std::memcpy(pkt.data(), &req6, sizeof(struct icmp6_hdr));
 
-            int sent = ::sendto(fd, pkt.data(), pkt.size(), 0,
-                                 (sockaddr*)&destAddr6, sizeof(sockaddr_in6));
+            const ssize_t sent = sendProbe(pkt, (sockaddr*)&destAddr6, sizeof(sockaddr_in6));
             if (sent < 0) {
-                SetErrorName(hs.ttl - 1, IP_GENERAL_FAILURE);
-                RecordProbe(hs.ttl - 1, false, 0, IP_GENERAL_FAILURE);
+                const DWORD st = SendStatusFor(errno);
+                SetErrorName(hs.ttl - 1, st);
+                RecordProbe(hs.ttl - 1, false, 0, st);
                 hs.pending = false;
             }
         } else {
             int val = hs.ttl;
             // Same reasoning as the v6 hop limit above.
             if (::setsockopt(fd, IPPROTO_IP, IP_TTL, &val, sizeof(val)) < 0) {
-                SetErrorName(hs.ttl - 1, IP_GENERAL_FAILURE);
-                RecordProbe(hs.ttl - 1, false, 0, IP_GENERAL_FAILURE);
+                const DWORD st = SendStatusFor(errno);
+                SetErrorName(hs.ttl - 1, st);
+                RecordProbe(hs.ttl - 1, false, 0, st);
                 hs.pending = false;
                 return;
             }
@@ -695,11 +744,11 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
             uint16_t cksum = calculate_checksum((const uint16_t*)pkt.data(), pkt.size());
             std::memcpy(pkt.data() + 2, &cksum, sizeof(cksum));
 
-            int sent = ::sendto(fd, pkt.data(), pkt.size(), 0,
-                                 (sockaddr*)&destAddr4, sizeof(sockaddr_in));
+            const ssize_t sent = sendProbe(pkt, (sockaddr*)&destAddr4, sizeof(sockaddr_in));
             if (sent < 0) {
-                SetErrorName(hs.ttl - 1, IP_GENERAL_FAILURE);
-                RecordProbe(hs.ttl - 1, false, 0, IP_GENERAL_FAILURE);
+                const DWORD st = SendStatusFor(errno);
+                SetErrorName(hs.ttl - 1, st);
+                RecordProbe(hs.ttl - 1, false, 0, st);
                 hs.pending = false;
             }
         }
@@ -774,7 +823,8 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                     // hop that never replies at all showed a bare "-"
                     // instead of "Request timed out." on Linux/macOS.
                     // Safe to call unconditionally: SetErrorName() only
-                    // writes when the hop's name is still empty, and the
+                    // writes when the hop's name is still empty (or holds a
+                    // provisional "Not sent" text), and the
                     // instant this hop ever gets a real reply, SetAddr()/
                     // SetAddr6() below trigger the one-time DNS resolve
                     // that overwrites it - so an occasional timeout on an
@@ -1084,6 +1134,10 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
                     haveSeq = true;
                     seq = ntohs(((struct icmp6_hdr*)errBuf)->icmp6_seq);
                 }
+                // An entry the kernel made itself (SO_EE_ORIGIN_LOCAL, from
+                // ip_local_error() or ipv6_local_error()) carries no payload,
+                // so it ends here too. Nothing is lost: such an error also
+                // fails the sendto() that caused it, which recorded it.
                 if (!haveSeq)
                     continue;
 
@@ -1426,10 +1480,22 @@ void OpenMTRNet::SetName(int at, char* n)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     strcpy_s(m_hops[at].name, sizeof(m_hops[at].name), n);
+    m_hops[at].nameIsLocal = false;
 }
 
-// Translate a Win32 ICMP status code into readable text. Only applied when
-// the hop has no name yet, so a real host name always wins.
+// OpenMTR's own "Not sent" codes (tracer.h). Only the POSIX engine produces
+// them, but SetErrorName() below is shared, so this is too.
+static bool IsLocalStatus(DWORD st)
+{
+    return st > static_cast<DWORD>(OPENMTR_STATUS_BASE)
+        && st <= static_cast<DWORD>(OPENMTR_NOT_SENT_OTHER);
+}
+
+// Translate a status code into readable text. Only applied when the hop has
+// no name yet, so a real host name always wins — with one exception: a
+// "Not sent" text is provisional. A burst of local failures (IPv6 dropping
+// for a few seconds) would otherwise label a silent hop for the rest of the
+// trace; the next non-local status replaces it instead.
 void OpenMTRNet::SetErrorName(int at, DWORD errnum)
 {
     const char* name;
@@ -1452,11 +1518,21 @@ void OpenMTRNet::SetErrorName(int at, DWORD errnum)
     case IP_OPTION_TOO_BIG:           name = "IP option too big."; break;
     case IP_BAD_DESTINATION:          name = "Bad destination."; break;
     case IP_GENERAL_FAILURE:          name = "General failure."; break;
+    case OPENMTR_NOT_SENT_NO_ROUTE:   name = "Not sent: no route from this machine."; break;
+    case OPENMTR_NOT_SENT_NO_ADDRESS: name = "Not sent: no usable local address."; break;
+    case OPENMTR_NOT_SENT_TOO_BIG:    name = "Not sent: probe too large."; break;
+    case OPENMTR_NOT_SENT_NO_BUFFERS: name = "Not sent: out of buffer space."; break;
+    case OPENMTR_NOT_SENT_REFUSED:    name = "Not sent: refused by this machine."; break;
+    case OPENMTR_NOT_SENT_OTHER:      name = "Not sent: local error."; break;
     default:                          name = "Unknown error."; break;
     }
+    const bool local = IsLocalStatus(errnum);
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!*m_hops[at].name)
-        strcpy_s(m_hops[at].name, sizeof(m_hops[at].name), name);
+    HopRecord& h = m_hops[at];
+    if (!*h.name || (h.nameIsLocal && !local)) {
+        strcpy_s(h.name, sizeof(h.name), name);
+        h.nameIsLocal = local;
+    }
 }
 
 // Record one completed probe atomically: bump xmit and, per outcome, either
