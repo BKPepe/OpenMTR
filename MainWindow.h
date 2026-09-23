@@ -2363,6 +2363,14 @@ private:
     // built well after the test actually stopped.
     QDateTime m_testStartTime;
     qint64    m_testDurationMs = 0;
+    // Address family of the trace in the table, for describing its statuses —
+    // also in a report made after Stop, when the IPv6 checkbox is editable
+    // again and may no longer match.
+    bool      m_traceIsV6 = false;
+    // The engine's last snapshot, taken at Stop. The engine itself is gone
+    // then, but the table stays and Copy/Export stay enabled, so the report's
+    // Notes (alternate responders, error statuses) come from here.
+    std::vector<OpenMTRHostInfo> m_finalState;
     mutable std::unordered_map<std::string, QString> m_asnCache;
     mutable std::unordered_set<std::string>           m_asnPending;
     bool    m_keyboardFocus = false;

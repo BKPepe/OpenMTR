@@ -2859,7 +2859,10 @@ void MainWindow::onStartStop()
         setTracingInputsEnabled(true);
         // The title bar subtitle keeps the final elapsed time of the finished
         // test; it is cleared when a new test starts.
-        if (m_net) updateTable();
+        if (m_net) {
+            updateTable();
+            m_finalState = m_net->getCurrentState();
+        }
         m_asnCache.clear();
         m_asnPending.clear();
         if (m_stack->currentIndex() == 1)
@@ -2947,6 +2950,8 @@ void MainWindow::onStartStop()
                     if (!self->m_tracing) return;
                     self->m_ipv6Check->setChecked(ipv6);
                     self->m_net      = net;
+                    self->m_traceIsV6 = ipv6;
+                    self->m_finalState.clear();
                     self->m_counting = false;
                     self->m_testStartTime = QDateTime();
                     self->m_testDurationMs = 0;
@@ -3133,6 +3138,18 @@ void MainWindow::onWarmupEnd()
 //  Results table & export
 // ==========================================================================
 
+// A probe's status for the tooltip and the export: the engine's own sentence
+// and the number, e.g. "Destination host unreachable, code 11003". The number
+// alone meant nothing to anyone without ipexport.h at hand; the text alone
+// would lose what a Windows report can be compared by.
+static QString describeStatus(unsigned long status, bool ipv6)
+{
+    QString text = QString::fromLatin1(OpenMTRStatusText(status, ipv6));
+    if (text.endsWith(QLatin1Char('.')))
+        text.chop(1);
+    return QStringLiteral("%1, code %2").arg(text).arg(status);
+}
+
 // Rebuild the table rows from the latest engine snapshot. Statistics come
 // straight from the engine — they are reset at reveal, so no baseline math
 // is needed here.
@@ -3210,7 +3227,7 @@ void MainWindow::updateTable()
                 if (h.anomalyCount > 0) {
                     if (!tip.isEmpty()) tip += ", ";
                     tip += QString("%1\u00d7 unexpected ICMP status/error (last: %2)")
-                               .arg(h.anomalyCount).arg(h.anomalyLast);
+                               .arg(h.anomalyCount).arg(describeStatus(h.anomalyLast, m_traceIsV6));
                 }
                 lossItem->setData(Qt::ToolTipRole, tip.isEmpty() ? QVariant() : QVariant(tip));
             }
@@ -3259,6 +3276,8 @@ QString MainWindow::buildJsonExport() const
         "hop", "asn", "hostname", "ip", "loss", "sent", "recv",
         "best", "avrg", "wrst", "last", "jttr"
     };
+    // The live engine while a trace runs, its last snapshot after Stop.
+    const auto st = m_net ? m_net->getCurrentState() : m_finalState;
     QJsonArray hops;
     for (int i = 0; i < m_table->rowCount(); ++i) {
         QJsonObject o;
@@ -3273,12 +3292,9 @@ QString MainWindow::buildJsonExport() const
             const int n = v.toInt(&numeric);
             o[keys[c]] = numeric ? QJsonValue(n) : QJsonValue(v);
         }
-        if (m_net) {
-            const auto st = m_net->getCurrentState();
-            if (i < static_cast<int>(st.size()) && st[i].altCount > 0) {
-                o["alt_ip"]    = QString::fromStdWString(addr_to_wstring(st[i].altAddr));
-                o["alt_count"] = st[i].altCount;
-            }
+        if (i < static_cast<int>(st.size()) && st[i].altCount > 0) {
+            o["alt_ip"]    = QString::fromStdWString(addr_to_wstring(st[i].altAddr));
+            o["alt_count"] = st[i].altCount;
         }
         hops.append(o);
     }
@@ -3345,9 +3361,10 @@ QString MainWindow::buildTextExport() const
     // Anomalous probe completions (a reply carrying an uncounted ICMP status,
     // or a soft failure of the send call) are invisible in the table but
     // matter when diagnosing unexplained single-packet losses — list them.
-    if (m_net) {
+    // After Stop the engine is gone; its last snapshot still has them.
+    {
         QString notes;
-        auto st = m_net->getCurrentState();
+        const auto st = m_net ? m_net->getCurrentState() : m_finalState;
         for (int i = 0; i < static_cast<int>(st.size()); ++i)
             if (st[i].altCount > 0)
                 notes += QString("  Hop %1: replies also arrived from %2 (%3 time(s)) \u2014 route change or per-packet load balancing\n")
@@ -3356,8 +3373,8 @@ QString MainWindow::buildTextExport() const
                              .arg(st[i].altCount);
         for (int i = 0; i < static_cast<int>(st.size()); ++i)
             if (st[i].anomalyCount > 0)
-                notes += QString("  Hop %1: %2 probe(s) ended with unexpected ICMP status/error %3\n")
-                             .arg(i + 1).arg(st[i].anomalyCount).arg(st[i].anomalyLast);
+                notes += QString("  Hop %1: %2 probe(s) ended with unexpected ICMP status/error: %3\n")
+                             .arg(i + 1).arg(st[i].anomalyCount).arg(describeStatus(st[i].anomalyLast, m_traceIsV6));
         if (!notes.isEmpty())
             out += "\nNotes:\n" + notes;
     }

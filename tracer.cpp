@@ -1530,6 +1530,50 @@ static bool IsLocalStatus(DWORD st)
         && st <= static_cast<DWORD>(OPENMTR_NOT_SENT_OTHER);
 }
 
+// The sentence for a status code: what the Hostname column shows for a hop
+// that has no name, and what the tooltip and the export print next to the
+// number (see tracer.h).
+const char* OpenMTRStatusText(unsigned long status, bool ipv6)
+{
+    // ipexport.h gives the ICMPv6 statuses the IPv4 numbers: 11002 is also
+    // IP_DEST_NO_ROUTE, 11003 IP_DEST_ADDR_UNREACHABLE, 11014-11015 the
+    // IPv6 reassembly-time-exceeded and parameter-problem codes, all close
+    // enough to the IPv4 sentence (11013, hop limit exceeded, is a normal
+    // reply and never gets here). 11004 is not: for IPv6 it is IP_DEST_PROHIBITED
+    // (ICMPv6 has no "protocol unreachable"). Only the Windows engine can
+    // produce it for an IPv6 trace; the POSIX one reports that ICMPv6 code
+    // as IP_BAD_ROUTE.
+    if (ipv6 && status == IP_DEST_PROT_UNREACHABLE)
+        return "Communication administratively prohibited.";
+    switch (status) {
+    case IP_BUF_TOO_SMALL:            return "Reply buffer too small.";
+    case IP_DEST_NET_UNREACHABLE:     return "Destination network unreachable.";
+    case IP_DEST_HOST_UNREACHABLE:    return "Destination host unreachable.";
+    case IP_DEST_PROT_UNREACHABLE:    return "Destination protocol unreachable.";
+    case IP_DEST_PORT_UNREACHABLE:    return "Destination port unreachable.";
+    case IP_NO_RESOURCES:             return "Insufficient IP resources.";
+    case IP_BAD_OPTION:               return "Bad IP option.";
+    case IP_HW_ERROR:                 return "Hardware error.";
+    case IP_PACKET_TOO_BIG:           return "Packet too big.";
+    case IP_REQ_TIMED_OUT:            return "Request timed out.";
+    case IP_BAD_REQ:                  return "Bad request.";
+    case IP_BAD_ROUTE:                return "Bad route.";
+    case IP_TTL_EXPIRED_REASSEM:      return "TTL expired during reassembly.";
+    case IP_PARAM_PROBLEM:            return "Parameter problem.";
+    case IP_SOURCE_QUENCH:            return "Source quench.";
+    case IP_OPTION_TOO_BIG:           return "IP option too big.";
+    case IP_BAD_DESTINATION:          return "Bad destination.";
+    case IP_GENERAL_FAILURE:          return "General failure.";
+    case OPENMTR_NOT_SENT_NO_ROUTE:   return "Not sent: no route from this machine.";
+    case OPENMTR_NOT_SENT_NO_ADDRESS: return "Not sent: no usable local address.";
+    case OPENMTR_NOT_SENT_TOO_BIG:    return "Not sent: probe too large.";
+    case OPENMTR_NOT_SENT_NO_BUFFERS: return "Not sent: out of buffer space.";
+    case OPENMTR_NOT_SENT_REFUSED:    return "Not sent: refused by this machine.";
+    case OPENMTR_NOT_SENT_OTHER:      return "Not sent: local error.";
+    default:                          return "Unknown error.";
+    }
+}
+
 // Translate a status code into readable text. Only applied when the hop has
 // no name yet, so a real host name always wins — with one exception: a
 // "Not sent" text is provisional. A burst of local failures (IPv6 dropping
@@ -1537,34 +1581,7 @@ static bool IsLocalStatus(DWORD st)
 // trace; the next non-local status replaces it instead.
 void OpenMTRNet::SetErrorName(int at, DWORD errnum)
 {
-    const char* name;
-    switch (errnum) {
-    case IP_BUF_TOO_SMALL:            name = "Reply buffer too small."; break;
-    case IP_DEST_NET_UNREACHABLE:     name = "Destination network unreachable."; break;
-    case IP_DEST_HOST_UNREACHABLE:    name = "Destination host unreachable."; break;
-    case IP_DEST_PROT_UNREACHABLE:    name = "Destination protocol unreachable."; break;
-    case IP_DEST_PORT_UNREACHABLE:    name = "Destination port unreachable."; break;
-    case IP_NO_RESOURCES:             name = "Insufficient IP resources."; break;
-    case IP_BAD_OPTION:               name = "Bad IP option."; break;
-    case IP_HW_ERROR:                 name = "Hardware error."; break;
-    case IP_PACKET_TOO_BIG:           name = "Packet too big."; break;
-    case IP_REQ_TIMED_OUT:            name = "Request timed out."; break;
-    case IP_BAD_REQ:                  name = "Bad request."; break;
-    case IP_BAD_ROUTE:                name = "Bad route."; break;
-    case IP_TTL_EXPIRED_REASSEM:      name = "TTL expired during reassembly."; break;
-    case IP_PARAM_PROBLEM:            name = "Parameter problem."; break;
-    case IP_SOURCE_QUENCH:            name = "Source quench."; break;
-    case IP_OPTION_TOO_BIG:           name = "IP option too big."; break;
-    case IP_BAD_DESTINATION:          name = "Bad destination."; break;
-    case IP_GENERAL_FAILURE:          name = "General failure."; break;
-    case OPENMTR_NOT_SENT_NO_ROUTE:   name = "Not sent: no route from this machine."; break;
-    case OPENMTR_NOT_SENT_NO_ADDRESS: name = "Not sent: no usable local address."; break;
-    case OPENMTR_NOT_SENT_TOO_BIG:    name = "Not sent: probe too large."; break;
-    case OPENMTR_NOT_SENT_NO_BUFFERS: name = "Not sent: out of buffer space."; break;
-    case OPENMTR_NOT_SENT_REFUSED:    name = "Not sent: refused by this machine."; break;
-    case OPENMTR_NOT_SENT_OTHER:      name = "Not sent: local error."; break;
-    default:                          name = "Unknown error."; break;
-    }
+    const char* name = OpenMTRStatusText(errnum, m_isV6);
     const bool local = IsLocalStatus(errnum);
     std::lock_guard<std::mutex> lock(m_mutex);
     HopRecord& h = m_hops[at];

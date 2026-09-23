@@ -89,6 +89,24 @@ static void status_text()
     n.SetErrorName(1, IP_REQ_TIMED_OUT);
     CHECK(nameOf(n, 1) == "router.example");
 
+    // Every error status in the IP_* table has a sentence of its own.
+    // IP_TTL_EXPIRED_TRANSIT is left out: a hop answering with it is a
+    // normal reply, never an error.
+    const unsigned long errors[] = {
+        IP_BUF_TOO_SMALL, IP_DEST_NET_UNREACHABLE, IP_DEST_HOST_UNREACHABLE,
+        IP_DEST_PROT_UNREACHABLE, IP_DEST_PORT_UNREACHABLE, IP_NO_RESOURCES,
+        IP_BAD_OPTION, IP_HW_ERROR, IP_PACKET_TOO_BIG, IP_REQ_TIMED_OUT, IP_BAD_REQ,
+        IP_BAD_ROUTE, IP_TTL_EXPIRED_REASSEM, IP_PARAM_PROBLEM, IP_SOURCE_QUENCH,
+        IP_OPTION_TOO_BIG, IP_BAD_DESTINATION, IP_GENERAL_FAILURE };
+    for (unsigned long st : errors)
+        CHECK(std::string(OpenMTRStatusText(st, false)) != "Unknown error.");
+    CHECK(std::string(OpenMTRStatusText(OPENMTR_STATUS_BASE, false)) == "Unknown error.");
+    // 11004 means something else for IPv6 on Windows (IP_DEST_PROHIBITED).
+    CHECK(std::string(OpenMTRStatusText(IP_DEST_PROT_UNREACHABLE, false))
+          == "Destination protocol unreachable.");
+    CHECK(std::string(OpenMTRStatusText(IP_DEST_PROT_UNREACHABLE, true))
+          == "Communication administratively prohibited.");
+
     const DWORD notSent[] = { OPENMTR_NOT_SENT_NO_ROUTE, OPENMTR_NOT_SENT_NO_ADDRESS,
                               OPENMTR_NOT_SENT_TOO_BIG, OPENMTR_NOT_SENT_NO_BUFFERS,
                               OPENMTR_NOT_SENT_REFUSED, OPENMTR_NOT_SENT_OTHER };
