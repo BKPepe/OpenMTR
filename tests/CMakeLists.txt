@@ -17,7 +17,8 @@ if(NOT MSVC)
     target_compile_options(engine_tests PRIVATE -Wall -Wextra)
 endif()
 
-foreach(name IN ITEMS dns_lifetime status_text v6_silent_first_hop)
+foreach(name IN ITEMS dns_lifetime status_text v6_silent_first_hop
+                      stop_before_start stop_right_after_start)
     add_test(NAME engine.${name} COMMAND engine_tests ${name})
     # A regression here can hang rather than crash, so bound every case.
     # 77 = this machine cannot run the case (e.g. no IPv6 ICMP socket):

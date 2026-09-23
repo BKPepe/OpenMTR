@@ -337,9 +337,14 @@ public:
 
     // Shared state read across threads: live flags, last target, handles.
     // Cross-thread flags: `tracing` is written by Stop/DoTrace and polled
-    // once per dispatch-loop pass; the other two are written once during
-    // construction.
+    // once per dispatch-loop pass; `stopRequested` is set by StopTrace() and
+    // never cleared; the other two are written once during construction.
     std::atomic<bool> tracing{false};
+    // Sticky, unlike `tracing`: a stop that lands before DoTrace() has
+    // started must still win, and DoTrace() itself sets `tracing` to true.
+    // An engine runs one trace (OpenMTRNetWrapper makes a new one each time),
+    // so there is nothing to clear it for.
+    std::atomic<bool> stopRequested{false};
     std::atomic<bool> hasIPv6{false};
     std::atomic<bool> initialized{false};
 

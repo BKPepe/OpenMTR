@@ -307,9 +307,18 @@ struct HopState {
 #ifdef _WIN32
 void OpenMTRNet::DoTrace(sockaddr* dest)
 {
-    tracing = true;
     ResetHops();
     if (m_stopEvent) ResetEvent(m_stopEvent);
+    // Set `tracing` first, then look for a stop. StopTrace() does the same
+    // two steps the other way round (stopRequested, then tracing = false),
+    // so whichever side runs first, the trace ends: either we see the
+    // request here, or its `tracing = false` lands after ours. A stop that
+    // arrived before the ResetEvent() above is caught here too.
+    tracing = true;
+    if (stopRequested) {
+        tracing = false;
+        return;
+    }
 
     const bool isV6       = (dest->sa_family == AF_INET6);
     const WORD payloadLen = (WORD)opts.pingsize;
@@ -550,13 +559,20 @@ static uint16_t calculate_checksum(const uint16_t* addr, int count)
 // poll() instead of IcmpSendEcho2()/WaitForMultipleObjects().
 void OpenMTRNet::DoTrace(sockaddr* dest)
 {
-    tracing = true;
     ResetHops();
 
     // Drain any stale wake-ups left over from a previous trace.
     if (m_stopPipe[0] != -1) {
         char dummy[128];
         while (::read(m_stopPipe[0], dummy, sizeof(dummy)) > 0) {}
+    }
+
+    // Same order as the Windows DoTrace() above, and for the same reason: a
+    // stop whose wake-up byte the drain just ate is still seen here.
+    tracing = true;
+    if (stopRequested) {
+        tracing = false;
+        return;
     }
 
     const bool isV6      = (dest->sa_family == AF_INET6);
@@ -1224,6 +1240,7 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
 // wait out its current timeout slice.
 void OpenMTRNet::StopTrace()
 {
+    stopRequested = true;     // before `tracing` — see DoTrace()
     tracing = false;
 #ifdef _WIN32
     if (m_stopEvent) SetEvent(m_stopEvent);

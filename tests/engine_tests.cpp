@@ -8,7 +8,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <memory>
+#include <stop_token>
 #include <string>
 #include <thread>
 
@@ -156,6 +158,73 @@ static int v6_silent_first_hop()
     return 0;
 }
 
+static sockaddr_in loopback4()
+{
+    sockaddr_in d{};
+#ifdef __APPLE__
+    d.sin_len = sizeof(d);
+#endif
+    d.sin_family      = AF_INET;
+    d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    return d;
+}
+
+// A StopTrace() that lands before DoTrace() has started must still end the
+// trace. DoTrace() used to set `tracing` itself and so undo it, leaving a
+// trace running with nothing left to stop it.
+static int stop_before_start()
+{
+    if (!pingSocketAvailable(AF_INET)) {
+        std::printf("skipped: no unprivileged ICMP socket here\n");
+        return 77;
+    }
+    OpenMTROptions o;
+    o.useDNS = false;
+    OpenMTRNet net(o);
+    net.StopTrace();
+    sockaddr_in dest = loopback4();
+    auto trace = std::async(std::launch::async,
+                            [&] { net.DoTrace(reinterpret_cast<sockaddr*>(&dest)); });
+    const bool ended = trace.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    CHECK(ended);
+    if (!ended)
+        net.StopTrace();    // a second stop does get through; lets the test finish
+    return 0;
+}
+
+// The same race the way the UI hits it: Start, then Stop before the worker
+// thread has got as far as DoTrace(). 127.0.0.1 keeps every probe on the
+// machine.
+static int stop_right_after_start()
+{
+    if (!pingSocketAvailable(AF_INET)) {
+        std::printf("skipped: no unprivileged ICMP socket here\n");
+        return 77;
+    }
+    struct Options : IOpenMTROptionsProvider {
+        unsigned getPingSize() const noexcept override { return 64; }
+    } options;
+    SOCKADDR_INET dest{};
+    dest.Ipv4 = loopback4();
+
+    int ignored = 0;
+    for (int i = 0; i < 10; ++i) {
+        std::stop_source stop;
+        auto trace = std::make_unique<OpenMTRNetWrapper>(&options);
+        trace->DoTrace(stop.get_token(), dest);
+        stop.request_stop();                 // what MainWindow's Stop does
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!trace->isDone() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(1))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!trace->isDone())
+            ++ignored;
+        // ~OpenMTRNetWrapper stops and joins, so a lost stop cannot hang here.
+    }
+    std::printf("stops ignored: %d of 10\n", ignored);
+    CHECK(ignored == 0);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     const std::string name = argc > 1 ? argv[1] : "";
@@ -166,6 +235,10 @@ int main(int argc, char** argv)
         status_text();
     else if (name == "v6_silent_first_hop")
         rc = v6_silent_first_hop();
+    else if (name == "stop_before_start")
+        rc = stop_before_start();
+    else if (name == "stop_right_after_start")
+        rc = stop_right_after_start();
     else {
         std::printf("unknown case \"%s\"\n", name.c_str());
         return 2;
