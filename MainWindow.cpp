@@ -2843,11 +2843,16 @@ void MainWindow::onStartStop()
         // reset the UI now, then poll a timer until the thread has finished.
         m_stopSource.request_stop();
         m_stopSource = std::stop_source{};
+        // A name lookup still running for this Start is now stale.
+        ++m_startGen;
         // Freeze the duration for the report now, while m_counting still
         // reflects whether counting had actually started — m_elapsed itself
         // keeps ticking wall-clock time and would overcount a report built
-        // well after this point.
-        m_testDurationMs = m_counting ? m_elapsed.elapsed() : 0;
+        // well after this point. Only if a trace was actually running: a
+        // Stop before the name resolved leaves the previous trace's table
+        // and report on screen, and its duration must stay with it.
+        if (m_net)
+            m_testDurationMs = m_counting ? m_elapsed.elapsed() : 0;
         m_tracing  = false;
         m_counting = false;
         m_refreshTimer->stop();
@@ -2893,6 +2898,10 @@ void MainWindow::onStartStop()
         if (target.isEmpty()) return;
 
         m_tracing = true;
+        // Identifies this Start to its name lookup, which cannot be
+        // cancelled: if Stop, or Stop and another Start, happens before it
+        // returns, its result belongs to nobody and is dropped.
+        const quint64 gen = ++m_startGen;
         m_startStopBtn->setText("Stop");
         m_startStopBtn->setProperty("tracing", true);
         m_startStopBtn->style()->polish(m_startStopBtn);
@@ -2906,9 +2915,9 @@ void MainWindow::onStartStop()
         IOpenMTROptionsProvider* provider = this;
         QPointer<MainWindow> self(this);
 
-        QTimer::singleShot(0, this, [self, provider, target, wantFamily, darkMode]() {
+        QTimer::singleShot(0, this, [self, provider, target, wantFamily, darkMode, gen]() {
             if (!self) return;
-            std::thread([self, provider, target, wantFamily, darkMode]() {
+            std::thread([self, provider, target, wantFamily, darkMode, gen]() {
                 auto net = std::make_shared<OpenMTRNetWrapper>(provider);
 
                 struct addrinfo hints = {}, *res = nullptr;
@@ -2933,21 +2942,20 @@ void MainWindow::onStartStop()
                     freeaddrinfo(res);
                 }
 
-                QMetaObject::invokeMethod(qApp, [self, net, target, addr, resolved, ipv6, darkMode]() {
-                    if (!self) return;
+                QMetaObject::invokeMethod(qApp, [self, net, target, addr, resolved, ipv6, darkMode, gen]() {
+                    // Checking m_tracing is not enough: after Stop and a new
+                    // Start it is true again, for a different trace.
+                    if (!self || self->m_startGen != gen) return;
                     if (!resolved) {
-                        bool userStopped = !self->m_tracing;
                         self->m_tracing = false;
                         self->m_startStopBtn->setText("Start");
                         self->m_startStopBtn->setProperty("tracing", false);
                         self->m_startStopBtn->style()->polish(self->m_startStopBtn);
                         self->m_startStopBtn->setEnabled(!self->m_targetEdit->text().trimmed().isEmpty());
                         self->setTracingInputsEnabled(true);
-                        if (!userStopped)
-                            MicaDialog::show(self, "OpenMTR", QString("Could not resolve \"%1\".").arg(target), darkMode);
+                        MicaDialog::show(self, "OpenMTR", QString("Could not resolve \"%1\".").arg(target), darkMode);
                         return;
                     }
-                    if (!self->m_tracing) return;
                     self->m_ipv6Check->setChecked(ipv6);
                     self->m_net      = net;
                     self->m_traceIsV6 = ipv6;

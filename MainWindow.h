@@ -2375,6 +2375,10 @@ private:
     // Export label the report with this, not with the input field, which the
     // user may have edited since (it is editable again once a trace stops).
     QString   m_reportTarget;
+    // Bumped by every Start and every Stop. A name lookup carries the value
+    // its Start got, and its result is ignored once that is no longer
+    // current (see onStartStop()).
+    quint64   m_startGen = 0;
     mutable std::unordered_map<std::string, QString> m_asnCache;
     mutable std::unordered_set<std::string>           m_asnPending;
     bool    m_keyboardFocus = false;
