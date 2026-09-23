@@ -653,6 +653,16 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         return;
     }
 
+#ifdef __APPLE__
+    // Room for the largest reply. macOS gives an ICMP socket an 8 KB receive
+    // buffer (net.inet.raw.recvspace = 8192), and an echo reply to a probe
+    // of about 8133 bytes or more does not fit in it with its overhead, so
+    // the kernel dropped it and every probe at those ping sizes timed out.
+    // A refusal is not fatal: everything else works as before.
+    int rcvbuf = 64 * 1024;
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+#endif
+
 #ifdef __linux__
     // Linux ping sockets don't hand ICMP error messages (Time Exceeded,
     // Destination Unreachable) to a plain recvfrom() the way macOS/BSD's
