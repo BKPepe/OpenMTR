@@ -81,6 +81,10 @@ qt_add_executable(OpenMTR
     main.cpp
     MainWindow.cpp
     MainWindow.h
+    cli.cpp
+    cli.h
+    report.cpp
+    report.h
     tracer.cpp
     tracer.h
     resources.qrc

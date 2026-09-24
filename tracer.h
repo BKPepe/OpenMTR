@@ -475,7 +475,9 @@ inline std::wstring addr_to_wstring(const SOCKADDR_INET& addr)
 class OpenMTRNetWrapper
 {
 public:
-    explicit OpenMTRNetWrapper(IOpenMTROptionsProvider* provider)
+    // `provider` is only needed by the DoTrace() overload that takes no
+    // options; report mode passes nullptr and its options explicitly.
+    explicit OpenMTRNetWrapper(IOpenMTROptionsProvider* provider = nullptr)
         : m_provider(provider)
     {}
 
@@ -487,26 +489,38 @@ public:
         }
     }
 
+    // The window's trace: ping size from the provider, everything else at
+    // its default.
     int DoTrace(std::stop_token stopToken, SOCKADDR_INET dest)
     {
-        m_done.store(false);
-
         OpenMTROptions opts;
         opts.pingsize = m_provider->getPingSize();
         opts.interval = 1.0;
         opts.useDNS   = true;
 
-        m_net = std::make_unique<OpenMTRNet>(opts);
+        const int rc = DoTrace(stopToken, dest, opts);
         // An engine-level failure (the ICMP capability handle could not be
         // opened) is surfaced here, still on the caller's (UI) thread; the
         // engine itself carries no UI dependency.
-        if (!m_net->initialized) {
+        if (rc != 0) {
 #ifdef _WIN32
             MessageBoxW(nullptr, L"Error opening ICMP handle!", L"OpenMTR",
                         MB_OK | MB_ICONERROR);
 #else
             fprintf(stderr, "Error opening ICMP handle!\n");
 #endif
+        }
+        return rc;
+    }
+
+    // Start a trace with explicit options. Returns -1, reporting nothing,
+    // if the engine could not be initialized.
+    int DoTrace(std::stop_token stopToken, SOCKADDR_INET dest, const OpenMTROptions& opts)
+    {
+        m_done.store(false);
+
+        m_net = std::make_unique<OpenMTRNet>(opts);
+        if (!m_net->initialized) {
             m_done.store(true);
             return -1;
         }

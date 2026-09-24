@@ -59,6 +59,7 @@ Duration: 2:00
 - **Configurable ping size** — adjust ICMP payload from 64 to 8192 bytes
 - **Light & dark themes** — switches instantly and auto-detects the system theme on launch; the title bar follows along natively on every platform (DWM on Windows, Cocoa appearance on macOS, the desktop portal's accent/theme setting on Linux)
 - **Custom frameless window** — the same Fluent-inspired look and controls on every platform; on macOS this includes a native application menu (About, Copy Report, Export…, Window)
+- **Headless report mode** — `OpenMTR --report --count 10 1.1.1.1` runs a trace without a window, prints the report (text or JSON) to stdout and exits with a meaningful exit code, for scripts, cron, SSH sessions and CI — see [Command-line report mode](#command-line-report-mode)
 - **Export & copy** — save results as `.txt`, `.csv`, or `.json` via a native Save dialog, or copy the full report to clipboard; double-click any cell to copy its value; exported text adapts column widths to actual content
 - **Keyboard shortcuts** — `Enter` in the target or ping size field starts/stops tracing; `Ctrl+C`/`⌘C` copies the full report to clipboard (or just the selected text when a text field is focused); `Ctrl+S`/`⌘S` opens the export dialog
 - **Smart column sizing** — Hostname and IP columns dynamically share available space based on content width, and the toolbar itself adapts as the window narrows
@@ -98,6 +99,66 @@ account so releases can be signed with a Developer ID and notarised.
 macOS will also ask for **local network** access on the first trace. A
 traceroute's first hop is normally your own router, so tracing anything needs
 it.
+
+---
+
+## Command-line report mode
+
+Like `mtr --report`, OpenMTR can run a trace without opening a window: it
+counts a fixed number of probe cycles, prints the same report as **Copy** /
+**Export** to stdout and exits. No display is needed, so it works over SSH,
+from cron and in CI pipelines.
+
+```sh
+OpenMTR --report --count 10 1.1.1.1
+OpenMTR --report --count 10 --json -6 example.com
+```
+
+| Option | Meaning |
+| --- | --- |
+| `<target>` | Host name or IP address to trace |
+| `-r`, `--report` | Run without a window and print a report (required) |
+| `-c`, `--count <N>` | Probe cycles to count before reporting (default 10) |
+| `-i`, `--interval <sec>` | Seconds between probes to each hop, 0.1–60 (default 1) |
+| `-s`, `--size <bytes>` | ICMP payload size, 64–8192 bytes (default 64) |
+| `-4` / `-6` | Use only IPv4 / only IPv6 (default: IPv4, falling back to IPv6) |
+| `-n`, `--no-dns` | Do not resolve host names of hops |
+| `--no-asn` | Do not look up AS numbers |
+| `-j`, `--json` | Print the report as JSON (same fields as the JSON export, plus the run's settings and `destination_reached`) |
+| `-h`, `--help` / `-v`, `--version` | Show the help / version and exit |
+
+Before counting starts, OpenMTR waits a moment for the route to settle, as the
+window does, so discovery probes are not counted. Hops that reply are then
+probed `--count` times. Hops that stay silent only give a result when a probe
+times out (after 5 s each), so they get fewer probes and never delay the report
+by more than one timeout.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Report printed; the destination replied |
+| 1 | Report printed; the destination never replied |
+| 2 | Invalid command line |
+| 3 | The target could not be resolved |
+| 4 | The trace could not start (no ICMP socket) |
+| 130 | Interrupted with Ctrl+C; the partial report is still printed |
+
+Platform notes:
+
+- **Windows** — `OpenMTR.exe` is a GUI program. Batch files wait for it and
+  see its exit code, but an interactive `cmd.exe` or PowerShell prompt does
+  not: the report appears after the prompt has already come back. To wait
+  there, use `start /wait "" OpenMTR.exe --report 1.1.1.1` in `cmd.exe`, or
+  pipe the output in PowerShell (`OpenMTR.exe --report 1.1.1.1 | Out-String`),
+  which also sets `$LASTEXITCODE`.
+- **macOS** — run the binary inside the app bundle:
+  `/Applications/OpenMTR.app/Contents/MacOS/OpenMTR --report 1.1.1.1`.
+- **Linux** — OpenMTR uses unprivileged ICMP ("ping") sockets. If a
+  distribution disables them, allow them with
+  `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`.
+- ASN lookups use `dig` on macOS and Linux; without it, the ASN column stays
+  empty.
 
 ---
 
