@@ -291,14 +291,20 @@ QString lookupAsn(const QString& ip, bool ipv6)
     // with.
     QProcess proc;
     proc.start("dig", {"+short", "txt", query});
-    if (proc.waitForFinished(2000)) {
-        QString out = QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
-        if (out.startsWith('"')) out.remove(0, 1);
-        if (out.endsWith('"'))   out.chop(1);
-        QString asn = out.split('|').first().trimmed();
-        if (!asn.isEmpty() && asn != "0")
-            return asn;
+    if (!proc.waitForFinished(2000)) {
+        // Timed out (or dig is missing): stop it here, or ~QProcess warns
+        // "Destroyed while process is still running" — which report mode
+        // would otherwise print into a script's stderr.
+        proc.kill();
+        proc.waitForFinished(1000);
+        return QString();
     }
+    QString out = QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+    if (out.startsWith('"')) out.remove(0, 1);
+    if (out.endsWith('"'))   out.chop(1);
+    QString asn = out.split('|').first().trimmed();
+    if (!asn.isEmpty() && asn != "0")
+        return asn;
     return QString();
 #endif
 }

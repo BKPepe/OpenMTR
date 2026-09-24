@@ -9,7 +9,7 @@
 //
 //  Exit codes (also listed in --help):
 //    0    report printed, the destination replied
-//    1    report printed, the destination never replied
+//    1    report printed, the destination never replied during the run
 //    2    invalid command line
 //    3    the target could not be resolved
 //    4    the trace could not start (no ICMP socket / handle)
@@ -26,6 +26,11 @@
 #include <QtCore/QDateTime>
 #include <QtCore/QJsonObject>
 #include <QtCore/QString>
+#include <QtCore/QtGlobal>
+
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -89,6 +94,29 @@ constexpr Ms kNameStall{1000};
 
 void writeTo(FILE* f, const QString& text)
 {
+#ifdef _WIN32
+    // A console gets UTF-16 through WriteConsoleW: every character shows
+    // whatever the console's code page is, and that code page — shared with
+    // the shell, and outliving us — is left alone. Files and pipes get UTF-8.
+    std::fflush(f);
+    const int fd = _fileno(f);            // negative when the stream has no handle
+    if (fd >= 0) {
+        const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+        DWORD mode = 0;
+        if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+            const auto* p = reinterpret_cast<const wchar_t*>(text.utf16());
+            DWORD left = static_cast<DWORD>(text.size());
+            while (left > 0) {
+                DWORD written = 0;
+                if (!WriteConsoleW(h, p, left, &written, nullptr) || written == 0)
+                    break;
+                p    += written;
+                left -= written;
+            }
+            return;
+        }
+    }
+#endif
     const QByteArray bytes = text.toUtf8();
     std::fwrite(bytes.constData(), 1, static_cast<size_t>(bytes.size()), f);
     std::fflush(f);
@@ -100,36 +128,55 @@ void printError(const QString& text)
 }
 
 #ifdef _WIN32
-// OpenMTR.exe is a GUI-subsystem program, so Windows gives it no console:
-// stdout and stderr only work where the shell redirected them to a file or
-// pipe. Anything left pointing nowhere is sent to the console of the shell
-// that started us instead.
-bool isRedirected(DWORD which)
+// True when a std stream has no destination of its own and should go to the
+// console: no handle at all, or a console handle. NUL and COM ports are
+// character devices too, but GetConsoleMode() fails on them, so `>nul` stays
+// silent. Only meaningful once we are attached to the console.
+bool wantsConsole(HANDLE h)
 {
-    const HANDLE h = GetStdHandle(which);
     if (!h || h == INVALID_HANDLE_VALUE)
+        return true;
+    switch (GetFileType(h)) {
+    case FILE_TYPE_DISK:
+    case FILE_TYPE_PIPE:
         return false;
-    const DWORD type = GetFileType(h);
-    return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
+    case FILE_TYPE_CHAR: {
+        DWORD mode = 0;
+        return GetConsoleMode(h, &mode) != 0;
+    }
+    default:
+        return true;
+    }
 }
 
+// OpenMTR.exe is a GUI-subsystem program, so Windows gives it no console of
+// its own. Attach to the console of the shell that started us — always, even
+// when both streams are redirected, because Ctrl+C only reaches processes
+// attached to the console — and send every stream the shell did not
+// redirect there.
 void attachParentConsole()
 {
-    const bool outRedirected = isRedirected(STD_OUTPUT_HANDLE);
-    const bool errRedirected = isRedirected(STD_ERROR_HANDLE);
-    if (outRedirected && errRedirected)
-        return;
+    // Read before attaching: attaching may fill in std handles that were
+    // unset.
+    const HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
     if (!AttachConsole(ATTACH_PARENT_PROCESS))
         return;                       // started without a console (Explorer, a service)
     FILE* stream = nullptr;
-    if (!outRedirected)
+    if (wantsConsole(out))
         freopen_s(&stream, "CONOUT$", "w", stdout);
-    if (!errRedirected)
+    if (wantsConsole(err))
         freopen_s(&stream, "CONOUT$", "w", stderr);
-    // Host names and the report's notes are UTF-8.
-    SetConsoleOutputCP(CP_UTF8);
 }
 #endif
+
+// Qt's own diagnostics (e.g. a QProcess warning) would land in a script's
+// stderr next to our messages; keep only the ones that mean something broke.
+void quietQtMessages(QtMsgType type, const QMessageLogContext&, const QString& msg)
+{
+    if (type == QtCriticalMsg || type == QtFatalMsg)
+        writeTo(stderr, msg + QLatin1Char('\n'));
+}
 
 // ==========================================================================
 //  Interruption
@@ -144,6 +191,15 @@ extern "C" void onInterrupt(int sig)
 {
     g_interrupted.store(true);
     std::signal(sig, SIG_DFL);
+}
+
+// Catch `sig` unless the parent made us ignore it: a script's `OpenMTR -r
+// ... &` starts with SIGINT ignored, and a Ctrl+C meant for the script's
+// foreground command must not cut the background report short.
+void catchSignal(int sig)
+{
+    if (std::signal(sig, onInterrupt) == SIG_IGN)
+        std::signal(sig, SIG_IGN);
 }
 
 // ==========================================================================
@@ -250,13 +306,37 @@ struct AsnCache {
 //  Entry points
 // ==========================================================================
 
+namespace {
+
+// "-r", "-rn", "-rjc5", "-hv": a cluster of report mode's short options
+// (runReportMode() defines them), read the way QCommandLineParser reads it —
+// flags r n j 4 6 h ? v, while c/i/s take the rest of the cluster as their
+// value. Any other letter means the argument is not ours (Qt's own GUI
+// options such as -platform or -reverse), and the window gets it.
+bool isReportCluster(const char* a)
+{
+    if (a[0] != '-' || a[1] == '\0' || a[1] == '-')
+        return false;
+    bool report = false;
+    for (const char* p = a + 1; *p; ++p) {
+        if (std::strchr("rhv?", *p))
+            report = true;
+        else if (std::strchr("cis", *p))
+            break;                        // the rest is the option's value
+        else if (!std::strchr("nj46", *p))
+            return false;
+    }
+    return report;
+}
+
+} // namespace
+
 bool isReportModeRequested(int argc, char* argv[])
 {
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
-        if (!std::strcmp(a, "--report") || !std::strcmp(a, "-r")
-            || !std::strcmp(a, "--help") || !std::strcmp(a, "-h") || !std::strcmp(a, "-?")
-            || !std::strcmp(a, "--version") || !std::strcmp(a, "-v"))
+        if (!std::strcmp(a, "--report") || !std::strcmp(a, "--help")
+            || !std::strcmp(a, "--version") || isReportCluster(a))
             return true;
     }
     return false;
@@ -267,6 +347,7 @@ int runReportMode(int argc, char* argv[])
 #ifdef _WIN32
     attachParentConsole();
 #endif
+    qInstallMessageHandler(quietQtMessages);
 
     QCoreApplication app(argc, argv);
     app.setApplicationName("OpenMTR");
@@ -280,7 +361,7 @@ int runReportMode(int argc, char* argv[])
         "\n"
         "Exit codes:\n"
         "  0    report printed, the destination replied\n"
-        "  1    report printed, the destination never replied\n"
+        "  1    report printed, the destination never replied during the run\n"
         "  2    invalid command line\n"
         "  3    the target could not be resolved\n"
         "  4    the trace could not start (no ICMP socket)\n"
@@ -288,7 +369,7 @@ int runReportMode(int argc, char* argv[])
     const QCommandLineOption reportOpt({"r", "report"},
         "Run without a window and print a report (required).");
     const QCommandLineOption countOpt({"c", "count"},
-        QString("Probe cycles to count before reporting (default %1).").arg(kDefaultCount), "N");
+        QString("Probes to send to each hop that replies before reporting (default %1).").arg(kDefaultCount), "N");
     const QCommandLineOption intervalOpt({"i", "interval"},
         QString("Seconds between probes to each hop, %1 to %2 (default 1).").arg(kMinInterval).arg(kMaxInterval),
         "seconds");
@@ -313,7 +394,15 @@ int runReportMode(int argc, char* argv[])
         return ExitUsage;
     }
     if (parser.isSet(helpOpt)) {
-        writeTo(stdout, parser.helpText());
+        QString help = parser.helpText();
+        // Run from the AppImage, argv[0] is its temporary mount
+        // (/tmp/.mount_*/usr/bin/OpenMTR), gone once we exit; show the path
+        // the user ran instead, which the AppImage runtime puts in ARGV0.
+        const QString shown  = qEnvironmentVariable("ARGV0");
+        const QString prefix = QStringLiteral("Usage: ") + app.arguments().constFirst();
+        if (qEnvironmentVariableIsSet("APPIMAGE") && !shown.isEmpty() && help.startsWith(prefix))
+            help.replace(0, prefix.size(), QStringLiteral("Usage: ") + shown);
+        writeTo(stdout, help);
         return ExitOk;
     }
     if (parser.isSet(versionOpt)) {
@@ -372,18 +461,37 @@ int runReportMode(int argc, char* argv[])
     const bool v6 = isV6(dest);
 
     // ---- Trace -------------------------------------------------------------
-    std::signal(SIGINT, onInterrupt);
+    catchSignal(SIGINT);
 #ifdef SIGTERM
-    std::signal(SIGTERM, onInterrupt);
+    catchSignal(SIGTERM);
 #endif
 
-    const auto engineError = [] {
+    // The engine does not say why it could not start; on POSIX, open a
+    // socket like its own to find out, so the advice fits the cause.
+    const auto engineError = [&] {
+#ifndef _WIN32
+        const int fd  = ::socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM,
+                                 v6 ? int(IPPROTO_ICMPV6) : int(IPPROTO_ICMP));
+        const int err = fd < 0 ? errno : 0;
+        if (fd >= 0)
+            ::close(fd);
+        if (err == EAFNOSUPPORT) {
+            printError("Could not open an ICMP socket: IPv6 is not available on this system.");
+            return ExitEngine;
+        }
 #ifdef __linux__
-        printError("Could not open an ICMP socket. Unprivileged ping sockets may be "
-                   "disabled; allow them with: sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"");
-#else
-        printError("Could not open an ICMP socket.");
+        if (err == EACCES || err == EPERM) {
+            printError("Could not open an ICMP socket: unprivileged ping sockets are disabled. "
+                       "Allow them with: sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"");
+            return ExitEngine;
+        }
 #endif
+        if (err != 0) {
+            printError(QString("Could not open an ICMP socket: %1").arg(QString::fromLocal8Bit(std::strerror(err))));
+            return ExitEngine;
+        }
+#endif
+        printError("Could not open an ICMP socket.");
         return ExitEngine;
     };
 
@@ -432,17 +540,22 @@ int runReportMode(int argc, char* argv[])
     }
 
     // Counting: statistics restart now, so they describe this window only.
-    // Done once every hop that replies has been probed `count` times and
-    // every other hop has at least one finished probe, so no row is left
-    // without a result. Probes to a silent hop only finish when they time
-    // out (5 s each), so hops that never or rarely reply cannot hold the
-    // report up beyond the time `count` cycles take plus one timeout.
+    // Done once every hop that has replied (at any time, warm-up included)
+    // has been probed `count` times and every other hop has at least one
+    // finished probe, so no row is left without a result. A lost probe only
+    // finishes when it times out (5 s), so lossy and silent hops cannot hold
+    // the report up beyond the time `count` probe periods take plus one
+    // timeout; they may end with fewer probes. Parking stays off: with it, a
+    // hop past the route edge could miss the whole window.
     if (!g_interrupted.load()) {
-        net->resetStats();
+        net->resetStats(false);
         started    = QDateTime::currentDateTime();
         countStart = Clock::now();
+        // The engines' real period (tracer.cpp), plus one period because a
+        // hop can be anywhere in its slot when the statistics reset.
+        const long long periodMs = static_cast<long long>(interval * 1000) + PROBE_PERIOD_PAD_MS;
         const auto deadline = countStart
-            + Ms(static_cast<long long>(count * interval * 1000) + ECHO_REPLY_TIMEOUT + 1000);
+            + Ms((static_cast<long long>(count) + 1) * periodMs + ECHO_REPLY_TIMEOUT + 1000);
         while (!g_interrupted.load()) {
             std::this_thread::sleep_for(kPollStep);
             if (net->isDone())
@@ -453,7 +566,7 @@ int runReportMode(int argc, char* argv[])
             bool done    = true;
             for (const auto& h : state) {
                 maxSent = std::max(maxSent, h.xmit);
-                if (h.xmit == 0 || (h.returned > 0 && h.xmit < count))
+                if (h.xmit == 0 || (hasAddr(h.addr) && h.xmit < count))
                     done = false;
             }
             if ((done && maxSent >= count) || Clock::now() >= deadline)
@@ -502,7 +615,10 @@ int runReportMode(int argc, char* argv[])
     for (int i = 0; i < static_cast<int>(state.size()); ++i) {
         const auto& h = state[i];
         rows.push_back(makeReportRow(i, h, hasAddr(h.addr) && useAsn ? asn->get(addressText(h.addr)) : QString()));
-        if (sameAddress(h.addr, dest) && h.returned > 0)
+        // The engine records an address only from a reply, so this is "the
+        // destination answered at some point", even if the counting window
+        // happened to catch only its losses.
+        if (sameAddress(h.addr, dest))
             reached = true;
     }
 

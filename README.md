@@ -118,7 +118,7 @@ OpenMTR --report --count 10 --json -6 example.com
 | --- | --- |
 | `<target>` | Host name or IP address to trace |
 | `-r`, `--report` | Run without a window and print a report (required) |
-| `-c`, `--count <N>` | Probe cycles to count before reporting (default 10) |
+| `-c`, `--count <N>` | Probes to send to each hop that replies before reporting (default 10) |
 | `-i`, `--interval <sec>` | Seconds between probes to each hop, 0.1–60 (default 1) |
 | `-s`, `--size <bytes>` | ICMP payload size, 64–8192 bytes (default 64) |
 | `-4` / `-6` | Use only IPv4 / only IPv6 (default: IPv4, falling back to IPv6) |
@@ -128,17 +128,23 @@ OpenMTR --report --count 10 --json -6 example.com
 | `-h`, `--help` / `-v`, `--version` | Show the help / version and exit |
 
 Before counting starts, OpenMTR waits a moment for the route to settle, as the
-window does, so discovery probes are not counted. Hops that reply are then
-probed `--count` times. Hops that stay silent only give a result when a probe
-times out (after 5 s each), so they get fewer probes and never delay the report
-by more than one timeout.
+window does, so discovery probes are not counted. Counting then ends once every
+hop that replies has been probed `--count` times and every silent hop has at
+least one timed-out probe. A lost probe only counts once it times out (after
+5 s), which has two consequences:
+
+- Silent and lossy hops can end with fewer than `--count` probes: the run
+  never lasts more than one timeout beyond `--count` probe cycles.
+- With a small `--count` (under about 5 s of probing), hops that reply keep
+  being probed while the first probes to silent hops time out, so they show
+  more than `--count` in *Sent*.
 
 Exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | 0 | Report printed; the destination replied |
-| 1 | Report printed; the destination never replied |
+| 1 | Report printed; the destination never replied during the run |
 | 2 | Invalid command line |
 | 3 | The target could not be resolved |
 | 4 | The trace could not start (no ICMP socket) |
@@ -151,12 +157,15 @@ Platform notes:
   not: the report appears after the prompt has already come back. To wait
   there, use `start /wait "" OpenMTR.exe --report 1.1.1.1` in `cmd.exe`, or
   pipe the output in PowerShell (`OpenMTR.exe --report 1.1.1.1 | Out-String`),
-  which also sets `$LASTEXITCODE`.
+  which also sets `$LASTEXITCODE`. Piped output is UTF-8; if PowerShell shows
+  non-ASCII characters garbled, run
+  `[Console]::OutputEncoding = [Text.Encoding]::UTF8` first.
 - **macOS** — run the binary inside the app bundle:
   `/Applications/OpenMTR.app/Contents/MacOS/OpenMTR --report 1.1.1.1`.
 - **Linux** — OpenMTR uses unprivileged ICMP ("ping") sockets. If a
   distribution disables them, allow them with
-  `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`.
+  `sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`. The AppImage
+  itself needs FUSE (or `--appimage-extract-and-run` without it).
 - ASN lookups use `dig` on macOS and Linux; without it, the ASN column stays
   empty.
 
