@@ -129,12 +129,14 @@ OpenMTR --report --count 10 --json -6 example.com
 
 Before counting starts, OpenMTR waits a moment for the route to settle, as the
 window does, so discovery probes are not counted. Counting then ends once every
-hop that replies has been probed `--count` times and every silent hop has at
-least one timed-out probe. A lost probe only counts once it times out (after
-5 s), which has two consequences:
+hop that has replied has `--count` finished probes, every silent hop has at
+least one, and at least one hop has `--count`. A lost probe only finishes once
+it times out (after 5 s), and its hop waits for that before the next probe,
+which has two consequences:
 
-- Silent and lossy hops can end with fewer than `--count` probes: the run
-  never lasts more than one timeout beyond `--count` probe cycles.
+- Counting ends at the latest `--count` + 1 probe periods plus about 6 s after
+  it starts. Hops that keep losing probes, or a route where no hop replies at
+  all, run to that limit and can end with fewer than `--count` probes.
 - With a small `--count` (under about 5 s of probing), hops that reply keep
   being probed while the first probes to silent hops time out, so they show
   more than `--count` in *Sent*.

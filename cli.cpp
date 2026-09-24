@@ -98,22 +98,27 @@ void writeTo(FILE* f, const QString& text)
     // A console gets UTF-16 through WriteConsoleW: every character shows
     // whatever the console's code page is, and that code page — shared with
     // the shell, and outliving us — is left alone. Files and pipes get UTF-8.
+    // Tried on any character device rather than gated on GetConsoleMode(),
+    // which needs read access a write-only console handle lacks; NUL and COM
+    // ports refuse WriteConsoleW and fall through to the byte path.
     std::fflush(f);
     const int fd = _fileno(f);            // negative when the stream has no handle
     if (fd >= 0) {
         const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-        DWORD mode = 0;
-        if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_CHAR) {
             const auto* p = reinterpret_cast<const wchar_t*>(text.utf16());
             DWORD left = static_cast<DWORD>(text.size());
+            bool  wrote = false;
             while (left > 0) {
                 DWORD written = 0;
                 if (!WriteConsoleW(h, p, left, &written, nullptr) || written == 0)
                     break;
+                wrote = true;
                 p    += written;
                 left -= written;
             }
-            return;
+            if (wrote || left == 0)
+                return;
         }
     }
 #endif
@@ -162,11 +167,12 @@ void attachParentConsole()
     const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
     if (!AttachConsole(ATTACH_PARENT_PROCESS))
         return;                       // started without a console (Explorer, a service)
+    // "w+": read access too, which GetConsoleMode() needs on these handles.
     FILE* stream = nullptr;
     if (wantsConsole(out))
-        freopen_s(&stream, "CONOUT$", "w", stdout);
+        freopen_s(&stream, "CONOUT$", "w+", stdout);
     if (wantsConsole(err))
-        freopen_s(&stream, "CONOUT$", "w", stderr);
+        freopen_s(&stream, "CONOUT$", "w+", stderr);
 }
 #endif
 
@@ -230,7 +236,19 @@ bool resolveTarget(const QString& target, int family, SOCKADDR_INET& out)
 }
 
 bool isV6(const SOCKADDR_INET& a)  { return a.Ipv6.sin6_family == AF_INET6; }
-bool hasAddr(const SOCKADDR_INET& a) { return a.Ipv4.sin_family != AF_UNSPEC; }
+// Whether the hop has answered: it has a real address. Not just a family —
+// the Windows engine sets hop 1's family before any probe goes out
+// (tracer.cpp), leaving 0.0.0.0 / :: there until a reply arrives.
+bool hasAddr(const SOCKADDR_INET& a)
+{
+    if (a.Ipv4.sin_family == AF_INET)
+        return a.Ipv4.sin_addr.s_addr != 0;
+    if (a.Ipv6.sin6_family == AF_INET6) {
+        static const in6_addr zero{};
+        return std::memcmp(&a.Ipv6.sin6_addr, &zero, sizeof(zero)) != 0;
+    }
+    return false;
+}
 
 bool sameAddress(const SOCKADDR_INET& a, const SOCKADDR_INET& b)
 {
@@ -311,18 +329,25 @@ namespace {
 // "-r", "-rn", "-rjc5", "-hv": a cluster of report mode's short options
 // (runReportMode() defines them), read the way QCommandLineParser reads it —
 // flags r n j 4 6 h ? v, while c/i/s take the rest of the cluster as their
-// value. Any other letter means the argument is not ours (Qt's own GUI
-// options such as -platform or -reverse), and the window gets it.
+// value. Any other cluster is not ours (Qt's own GUI options such as
+// -platform, -visual), and the window gets it — except one that starts with
+// r: Qt's only such option is -reverse, so anything else there is report
+// mode with a typo or an mtr-only letter (-rwc 10), which the parser then
+// reports as a usage error instead of the window opening.
 bool isReportCluster(const char* a)
 {
     if (a[0] != '-' || a[1] == '\0' || a[1] == '-')
         return false;
-    bool report = false;
+    if (a[1] == 'r')
+        return std::strcmp(a, "-reverse") != 0;
+    bool report = false, sawR = false;
     for (const char* p = a + 1; *p; ++p) {
-        if (std::strchr("rhv?", *p))
+        if (*p == 'r')
+            report = sawR = true;
+        else if (std::strchr("hv?", *p))
             report = true;
         else if (std::strchr("cis", *p))
-            break;                        // the rest is the option's value
+            return sawR;                  // the rest is a value; -c/-i/-s need -r (not -visual)
         else if (!std::strchr("nj46", *p))
             return false;
     }
@@ -398,9 +423,14 @@ int runReportMode(int argc, char* argv[])
         // Run from the AppImage, argv[0] is its temporary mount
         // (/tmp/.mount_*/usr/bin/OpenMTR), gone once we exit; show the path
         // the user ran instead, which the AppImage runtime puts in ARGV0.
+        // Only when we really run from it: other AppImages leak these
+        // variables into every process they start.
         const QString shown  = qEnvironmentVariable("ARGV0");
-        const QString prefix = QStringLiteral("Usage: ") + app.arguments().constFirst();
-        if (qEnvironmentVariableIsSet("APPIMAGE") && !shown.isEmpty() && help.startsWith(prefix))
+        const QString appDir = qEnvironmentVariable("APPDIR");
+        const QString argv0  = app.arguments().constFirst();
+        const QString prefix = QStringLiteral("Usage: ") + argv0;
+        if (!appDir.isEmpty() && argv0.startsWith(appDir + QLatin1Char('/'))
+            && !shown.isEmpty() && help.startsWith(prefix))
             help.replace(0, prefix.size(), QStringLiteral("Usage: ") + shown);
         writeTo(stdout, help);
         return ExitOk;
@@ -541,12 +571,13 @@ int runReportMode(int argc, char* argv[])
 
     // Counting: statistics restart now, so they describe this window only.
     // Done once every hop that has replied (at any time, warm-up included)
-    // has been probed `count` times and every other hop has at least one
-    // finished probe, so no row is left without a result. A lost probe only
-    // finishes when it times out (5 s), so lossy and silent hops cannot hold
-    // the report up beyond the time `count` probe periods take plus one
-    // timeout; they may end with fewer probes. Parking stays off: with it, a
-    // hop past the route edge could miss the whole window.
+    // has been probed `count` times, every other hop has at least one
+    // finished probe (so no row is left without a result), and some hop has
+    // reached `count`. A lost probe only finishes when it times out (5 s), so
+    // lossy hops, or a route where nothing replies, run to the deadline below
+    // ((count + 1) periods + one timeout + 1 s) and may end with fewer
+    // probes. Parking stays off: with it, a hop past the route edge could
+    // miss the whole window.
     if (!g_interrupted.load()) {
         net->resetStats(false);
         started    = QDateTime::currentDateTime();
@@ -618,7 +649,7 @@ int runReportMode(int argc, char* argv[])
         // The engine records an address only from a reply, so this is "the
         // destination answered at some point", even if the counting window
         // happened to catch only its losses.
-        if (sameAddress(h.addr, dest))
+        if (hasAddr(h.addr) && sameAddress(h.addr, dest))
             reached = true;
     }
 
