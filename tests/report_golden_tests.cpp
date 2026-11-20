@@ -62,12 +62,12 @@ SOCKADDR_INET v6(const char* text)
     return a;
 }
 
-OpenMTRHostInfo hop(SOCKADDR_INET addr, const std::wstring& name, int xmit, int returned,
+OpenMTRHostInfo hop(SOCKADDR_INET addr, const std::string& name, int xmit, int returned,
                     int best, int worst, int last, unsigned long total, unsigned long jitterSum)
 {
     OpenMTRHostInfo h;
     h.addr      = addr;
-    h.m_name    = name;
+    h.name      = name;
     h.xmit      = xmit;
     h.returned  = returned;
     h.best      = best;
@@ -82,45 +82,45 @@ std::vector<OpenMTRHostInfo> snapshotV4()
 {
     std::vector<OpenMTRHostInfo> s;
     // 1: plain hop
-    s.push_back(hop(v4("192.0.2.1"), L"router.example", 10, 10, 1, 5, 2, 25, 9));
+    s.push_back(hop(v4("192.0.2.1"), "router.example", 10, 10, 1, 5, 2, 25, 9));
     // 2: replies also came from a second address
     {
-        OpenMTRHostInfo h = hop(v4("198.51.100.7"), L"edge-1.example", 10, 9, 8, 21, 9, 99, 30);
+        OpenMTRHostInfo h = hop(v4("198.51.100.7"), "edge-1.example", 10, 9, 8, 21, 9, 99, 30);
         h.altAddr  = v4("198.51.100.8");
         h.altCount = 3;
         s.push_back(h);
     }
     // 3: anomalous completions, no reverse name (shows the address)
     {
-        OpenMTRHostInfo h = hop(v4("203.0.113.5"), L"203.0.113.5", 10, 8, 11, 14, 12, 98, 7);
+        OpenMTRHostInfo h = hop(v4("203.0.113.5"), "203.0.113.5", 10, 8, 11, 14, 12, 98, 7);
         h.anomalyCount = 2;
         h.anomalyLast  = IP_DEST_HOST_UNREACHABLE;
         s.push_back(h);
     }
     // 4: error row — never answered, the engine's status text instead
-    s.push_back(hop(SOCKADDR_INET{}, L"Request timed out.", 10, 0, 0, 0, 0, 0, 0));
+    s.push_back(hop(SOCKADDR_INET{}, "Request timed out.", 10, 0, 0, 0, 0, 0, 0));
     // 5: no data yet
-    s.push_back(hop(SOCKADDR_INET{}, L"", 0, 0, 0, 0, 0, 0, 0));
+    s.push_back(hop(SOCKADDR_INET{}, "", 0, 0, 0, 0, 0, 0, 0));
     // 6: multi-origin prefix: the ASN cell holds two numbers
-    s.push_back(hop(v4("192.0.2.66"), L"multi.example", 10, 10, 15, 19, 16, 161, 12));
+    s.push_back(hop(v4("192.0.2.66"), "multi.example", 10, 10, 15, 19, 16, 161, 12));
     // 7: an all-digit name (JSON types it as a number)
-    s.push_back(hop(v4("192.0.2.77"), L"1234", 10, 1, 17, 17, 17, 17, 0));
+    s.push_back(hop(v4("192.0.2.77"), "1234", 10, 1, 17, 17, 17, 17, 0));
     // 8: hostile name: formula prefix, CSV/JSON metacharacters, a slash,
     //    non-ASCII, TAB, a control character, DEL and U+2028
     s.push_back(hop(v4("198.51.100.99"),
-                    L"=cmd|' /c calc'!A0,\"q\" café\tx\x1c\x7f end",
+                    "=cmd|' /c calc'!A0,\"q\" caf\xC3\xA9\tx\x1C\x7F\xE2\x80\xA8" "end",
                     10, 10, 20, 24, 21, 215, 18));
     // 9: the destination
-    s.push_back(hop(v4("203.0.113.200"), L"dest.example", 10, 10, 22, 30, 23, 239, 15));
+    s.push_back(hop(v4("203.0.113.200"), "dest.example", 10, 10, 22, 30, 23, 239, 15));
     return s;
 }
 
 std::vector<OpenMTRHostInfo> snapshotV6()
 {
     std::vector<OpenMTRHostInfo> s;
-    s.push_back(hop(v6("2001:db8::1"), L"gw6.example", 20, 20, 1, 3, 1, 30, 10));
+    s.push_back(hop(v6("2001:db8::1"), "gw6.example", 20, 20, 1, 3, 1, 30, 10));
     {
-        OpenMTRHostInfo h = hop(v6("2001:db8:1::2"), L"2001:db8:1::2", 20, 18, 9, 40, 12, 230, 51);
+        OpenMTRHostInfo h = hop(v6("2001:db8:1::2"), "2001:db8:1::2", 20, 18, 9, 40, 12, 230, 51);
         h.altAddr      = v6("2001:db8:1::3");
         h.altCount     = 1;
         // IPv6 renders this status differently (administratively prohibited)
@@ -128,7 +128,7 @@ std::vector<OpenMTRHostInfo> snapshotV6()
         h.anomalyLast  = IP_DEST_PROT_UNREACHABLE;
         s.push_back(h);
     }
-    s.push_back(hop(v6("2001:db8:2::1"), L"dest6.example", 20, 20, 30, 33, 31, 620, 20));
+    s.push_back(hop(v6("2001:db8:2::1"), "dest6.example", 20, 20, 30, 33, 31, 620, 20));
     return s;
 }
 

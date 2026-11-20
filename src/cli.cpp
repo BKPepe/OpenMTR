@@ -395,8 +395,7 @@ int cli::run(int argc, char** argv)
         // lookups run concurrently with route discovery.
         for (const auto& h : state)
             if (h.addr.Ipv4.sin_family != AF_UNSPEC)
-                asnCache.get(QString::fromStdWString(addr_to_wstring(h.addr)).toStdString(),
-                             h.addr.Ipv6.sin6_family == AF_INET6);
+                asnCache.get(addr_to_string(h.addr), h.addr.Ipv6.sin6_family == AF_INET6);
         progress.update(QString("Discovering route... (%1s)").arg(elapsedMs() / 1000));
         if (warmupRouteSettled(fp, state, checkHops, elapsedMs()))
             break;
@@ -491,11 +490,11 @@ int cli::run(int argc, char** argv)
 
     // Reached: the resolved destination address appeared among the hops
     // that actually answered at least once during the run.
-    const QString destStr = QString::fromStdWString(addr_to_wstring(addr));
+    const std::string destStr = addr_to_string(addr);
     bool reached = false;
     for (const auto& h : finalState) {
         if (h.addr.Ipv4.sin_family == AF_UNSPEC) continue;
-        if (QString::fromStdWString(addr_to_wstring(h.addr)) == destStr) {
+        if (addr_to_string(h.addr) == destStr) {
             reached = true;
             break;
         }

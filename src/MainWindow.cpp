@@ -2892,7 +2892,7 @@ void MainWindow::onWarmupEnd()
     // time the table is revealed.
     for (const auto& h : state)
         if (h.addr.Ipv4.sin_family != AF_UNSPEC)
-            getCachedASN(QString::fromStdWString(addr_to_wstring(h.addr)),
+            getCachedASN(QString::fromStdString(addr_to_string(h.addr)),
                          h.addr.Ipv6.sin6_family == AF_INET6);
 
     const int gen = m_warmupGen;
@@ -2989,7 +2989,7 @@ void MainWindow::updateTable()
         const bool multipath = hasAddr && h.altCount > 0;
         const QString mpTip = multipath
             ? QString("Also replies: %1 (%2\u00d7)")
-                  .arg(QString::fromStdWString(addr_to_wstring(h.altAddr)))
+                  .arg(QString::fromStdString(addr_to_string(h.altAddr)))
                   .arg(h.altCount)
             : QString();
         for (int c : {static_cast<int>(ColHostname), static_cast<int>(ColIp)}) {

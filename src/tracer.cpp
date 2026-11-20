@@ -1316,15 +1316,25 @@ static void DnsResolverThread(void* p)
     const auto publish = [&sink, &args](const char* name) {
         std::lock_guard<std::mutex> lock(sink.mutex);
         if (sink.net)
-            sink.net->SetName(args->index, const_cast<char*>(name));
+            sink.net->SetName(args->index, name);
     };
 
     if (!getnameinfo(sa, salen, hostname, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST))
         publish(hostname);
 
     if (wantDns) {
+#ifdef _WIN32
+        // The wide-character call, converted to UTF-8: getnameinfo() answers
+        // in the ANSI code page, which cannot hold every name (and was then
+        // widened byte by byte, garbling anything non-ASCII).
+        wchar_t wide[NI_MAXHOST];
+        if (!GetNameInfoW(sa, salen, wide, NI_MAXHOST, nullptr, 0, 0)
+            && WideCharToMultiByte(CP_UTF8, 0, wide, -1, hostname, NI_MAXHOST, nullptr, nullptr) > 0)
+            publish(hostname);
+#else
         if (!getnameinfo(sa, salen, hostname, NI_MAXHOST, nullptr, 0, 0))
             publish(hostname);
+#endif
     }
 }
 
@@ -1559,16 +1569,33 @@ void OpenMTRNet::SetAddr6(int at, IPV6_ADDRESS_EX addrex)
 // Store the resolved host name for hop `at`. A PTR record can hold any
 // bytes, and not every C library filters them, so control characters become
 // '?' here: in the reports a line feed would start a new CSV row, and ESC a
-// terminal escape sequence.
-void OpenMTRNet::SetName(int at, char* n)
+// terminal escape sequence. U+0080 to U+009F are control characters too,
+// two bytes each in UTF-8.
+void OpenMTRNet::SetName(int at, const char* n)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    strcpy_s(m_hops[at].name, sizeof(m_hops[at].name), n);
-    for (char* c = m_hops[at].name; *c; ++c) {
-        const unsigned char u = static_cast<unsigned char>(*c);
-        if (u < 0x20 || u == 0x7F)
-            *c = '?';
+    // Truncate rather than fail: strcpy_s() would empty the name (POSIX
+    // shim) or abort the process (MSVC) on a name longer than the record,
+    // and a UTF-8 name must not be cut inside a character.
+    size_t len = strlen(n);
+    if (len >= sizeof(m_hops[at].name)) {
+        len = sizeof(m_hops[at].name) - 1;
+        while (len > 0 && (static_cast<unsigned char>(n[len]) & 0xC0) == 0x80)
+            --len;
     }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    char*  name = m_hops[at].name;
+    size_t out  = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char u    = static_cast<unsigned char>(n[i]);
+        const unsigned char next = i + 1 < len ? static_cast<unsigned char>(n[i + 1]) : 0;
+        if (u == 0xC2 && next >= 0x80 && next <= 0x9F) {
+            name[out++] = '?';                       // U+0080..U+009F
+            ++i;
+        } else {
+            name[out++] = (u < 0x20 || u == 0x7F) ? '?' : n[i];
+        }
+    }
+    name[out] = '\0';
     m_hops[at].nameIsLocal = false;
 }
 

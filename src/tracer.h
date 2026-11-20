@@ -367,7 +367,9 @@ public:
     // outcome, and from the background DNS resolver thread for SetName().
     void SetAddr(int at, u_long addr);
     void SetAddr6(int at, IPV6_ADDRESS_EX addrex);
-    void SetName(int at, char* n);
+    // `n` is UTF-8; one longer than the record holds is cut at a character
+    // boundary.
+    void SetName(int at, const char* n);
     void SetErrorName(int at, DWORD errnum);
     // One completed probe: bumps xmit and, per outcome, either the reply
     // statistics (returned, RTT figures, jitter) or the anomaly bookkeeping.
@@ -469,9 +471,13 @@ struct OpenMTRHostInfo {
     int           last     = 0;
     unsigned long total    = 0;
     unsigned long jitterSum = 0;
-    std::wstring  m_name;
+    // UTF-8: the hop's reverse-DNS name, else its address, else the engine's
+    // status text ("Request timed out."); empty before anything is known. A
+    // name is whatever bytes the resolver returned, which on POSIX need not
+    // be valid UTF-8 — consumers repair that (report_core, the GUI).
+    std::string   name;
 
-    std::wstring getName() const { return m_name; }
+    const std::string& getName() const { return name; }
     int getAvg() const {
         return (returned == 0) ? 0 : static_cast<int>(total / returned);
     }
@@ -482,27 +488,16 @@ struct OpenMTRHostInfo {
     }
 };
 
-// Format a SOCKADDR_INET (v4 or v6) as a printable address string.
-inline std::wstring addr_to_wstring(const SOCKADDR_INET& addr)
+// Format a SOCKADDR_INET (v4 or v6) as a printable address string; empty
+// when it holds no address.
+inline std::string addr_to_string(const SOCKADDR_INET& addr)
 {
-#ifdef _WIN32
-    wchar_t buf[64] = {};
-    if      (addr.si_family == AF_INET)
-        InetNtopW(AF_INET,  &addr.Ipv4.sin_addr,  buf, 64);
-    else if (addr.si_family == AF_INET6)
-        InetNtopW(AF_INET6, &addr.Ipv6.sin6_addr, buf, 64);
-    return buf;
-#else
-    // No wide-string ntop on POSIX: convert the narrow result instead. Every
-    // byte is ASCII (digits, dots, colons, hex), so the widen is lossless.
-    char buf[64] = {};
+    char buf[INET6_ADDRSTRLEN] = {};
     if      (addr.Ipv4.sin_family  == AF_INET)
         inet_ntop(AF_INET,  &addr.Ipv4.sin_addr,  buf, sizeof(buf));
     else if (addr.Ipv6.sin6_family == AF_INET6)
         inet_ntop(AF_INET6, &addr.Ipv6.sin6_addr, buf, sizeof(buf));
-    std::string s(buf);
-    return std::wstring(s.begin(), s.end());
-#endif
+    return buf;
 }
 
 // ==========================================================================
@@ -651,10 +646,13 @@ public:
             h.anomalyCount = snap.anomalyCount;
             h.anomalyLast  = snap.anomalyLast;
 
+            // The name bytes as they are. They used to be widened one byte
+            // at a time into a std::wstring, which turned every non-ASCII
+            // character of a UTF-8 name into garbage.
             if (snap.name[0])
-                h.m_name = std::wstring(snap.name, snap.name + strlen(snap.name));
+                h.name = snap.name;
             else if (h.addr.Ipv4.sin_family != AF_UNSPEC)
-                h.m_name = addr_to_wstring(h.addr);
+                h.name = addr_to_string(h.addr);
 
             state.push_back(h);
         }

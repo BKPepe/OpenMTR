@@ -127,6 +127,19 @@ flag now; it used to call `std::stop_source::request_stop()`).
 wherever one opens; an unprivileged user in a fresh network namespace gets one,
 which is how the core-linux CI job runs it.
 
+### Non-ASCII host names garbled
+`OpenMTRHostInfo` carried a hop's name as a `std::wstring`, made by widening
+the engine's `char` buffer one byte at a time — so each byte of a UTF-8
+name became its own character: on x86 and MIPS (signed `char`) garbage code
+points, on ARM Latin-1 mojibake ("rÃ©seau" for "réseau"). On Windows the
+buffer held the ANSI code page from `getnameinfo()`, with the same widening
+on top. Names are UTF-8 `std::string`s end to end now: Windows asks
+`GetNameInfoW()` and converts to UTF-8, `SetName()` cuts an over-long name
+at a character boundary (it used to empty it — or, through MSVC's
+`strcpy_s`, abort), and the GUI/report layer replaces bytes that are not
+valid UTF-8 (a raw PTR answer can hold anything). **Regression test**:
+`utf8_names`; the golden report tests carry a non-ASCII name.
+
 ### "Finishing..." progress line running into the report on stdout
 `Progress`'s line-clear only happened in its destructor, which fires at
 function-scope end — *after* the report had already been written to stdout.

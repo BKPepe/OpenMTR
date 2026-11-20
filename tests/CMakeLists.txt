@@ -18,7 +18,7 @@ if(NOT MSVC)
     target_compile_options(engine_tests PRIVATE -Wall -Wextra)
 endif()
 
-foreach(name IN ITEMS dns_lifetime status_text v6_silent_first_hop
+foreach(name IN ITEMS dns_lifetime status_text utf8_names v6_silent_first_hop
                       stop_before_start stop_right_after_start refused_socket
                       raw_socket raw_fallback)
     add_test(NAME engine.${name} COMMAND engine_tests ${name})

@@ -49,9 +49,11 @@ std::vector<ReportRow> computeReportRows(const std::vector<OpenMTRHostInfo>& sta
         const auto& h = state[i];
         ReportRow row;
 
-        QString ip   = QString::fromStdWString(addr_to_wstring(h.addr));
+        QString ip   = QString::fromStdString(addr_to_string(h.addr));
         bool hasAddr = (h.addr.Ipv4.sin_family != AF_UNSPEC);
-        QString name = QString::fromStdWString(h.getName());
+        // fromStdString: UTF-8, with any invalid bytes of a raw resolver
+        // answer replaced by U+FFFD.
+        QString name = QString::fromStdString(h.getName());
         if (hasAddr && name.isEmpty()) name = ip;
         // Hops without an address show the engine's status text ("Request
         // timed out.", "Destination host unreachable.", ...) so active ICMP
@@ -115,7 +117,7 @@ QString buildJsonReport(const QString& target,
             o[keys[c]] = numeric ? QJsonValue(n) : QJsonValue(v);
         }
         if (i < state.size() && state[i].altCount > 0) {
-            o["alt_ip"]    = QString::fromStdWString(addr_to_wstring(state[i].altAddr));
+            o["alt_ip"]    = QString::fromStdString(addr_to_string(state[i].altAddr));
             o["alt_count"] = state[i].altCount;
         }
         hops.append(o);
@@ -225,7 +227,7 @@ QString buildTextReport(const QString& target,
             if (state[i].altCount > 0)
                 notes += QString("  Hop %1: replies also arrived from %2 (%3 time(s)) \u2014 route change or per-packet load balancing\n")
                              .arg(i + 1)
-                             .arg(QString::fromStdWString(addr_to_wstring(state[i].altAddr)))
+                             .arg(QString::fromStdString(addr_to_string(state[i].altAddr)))
                              .arg(state[i].altCount);
         for (size_t i = 0; i < state.size(); ++i)
             if (state[i].anomalyCount > 0)
@@ -314,7 +316,7 @@ bool dnsAndAsnSettled(DnsSettle& d,
     for (const auto& h : state) {
         if (h.addr.Ipv4.sin_family == AF_UNSPEC) continue;
         ++addressed;
-        if (h.getName() != addr_to_wstring(h.addr)) ++named;
+        if (h.getName() != addr_to_string(h.addr)) ++named;
     }
     bool dnsSettled;
     if (addressed == 0 || named >= addressed)  dnsSettled = true;

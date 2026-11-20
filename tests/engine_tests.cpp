@@ -160,7 +160,7 @@ static void icmp_checksum()
 
 // A PTR record can hold any bytes. SetName() turns control characters into
 // '?', so that a name cannot start a new CSV row or a terminal escape
-// sequence; everything else, bytes above 0x7F included, stays.
+// sequence; everything else stays.
 static void name_control_chars()
 {
     OpenMTROptions o;
@@ -178,6 +178,11 @@ static void name_control_chars()
     char utf8[] = "b\xc3\xbc" "cher.example";
     n.SetName(2, utf8);
     CHECK(nameOf(n, 2) == "b\xc3\xbc" "cher.example");
+
+    // U+009B (CSI) and U+0085 are control characters of two bytes each;
+    // U+00A0, right after them, is not.
+    n.SetName(3, "x\xc2\x9b" "31m\xc2\x85y\xc2\xa0z");
+    CHECK(nameOf(n, 3) == "x?31m?y\xc2\xa0z");
 }
 
 // SetAddr() starts a reverse-DNS thread for a hop's new address. With no
@@ -223,6 +228,32 @@ static int no_thread_for_dns()
     std::printf("skipped: no way to run out of threads on purpose here\n");
     return 77;
 #endif
+}
+
+// Host names are UTF-8 end to end: SetName() keeps them byte for byte, and
+// cuts one longer than the record at a character boundary — never inside a
+// character, and never by emptying it (what strcpy_s did on overflow).
+static void utf8_names()
+{
+    OpenMTROptions o;
+    o.useDNS = false;
+    OpenMTRNet n(o);
+
+    n.SetName(0, "r\xC3\xA9seau.example");             // "réseau.example"
+    CHECK(nameOf(n, 0) == "r\xC3\xA9seau.example");
+
+    std::string longName;
+    while (longName.size() < 300)
+        longName += "\xC3\xA9";                          // é, two bytes each
+    n.SetName(1, longName.c_str());
+    const std::string stored = nameOf(n, 1);
+    std::printf("stored %zu of %zu bytes\n", stored.size(), longName.size());
+    CHECK(stored.size() == 254);                         // 127 whole characters
+    CHECK(stored == longName.substr(0, 254));
+
+    const std::string ascii(400, 'a');
+    n.SetName(2, ascii.c_str());
+    CHECK(nameOf(n, 2) == ascii.substr(0, 255));
 }
 
 // Whether this process may open an unprivileged ICMP socket of that family
@@ -543,6 +574,8 @@ int main(int argc, char** argv)
         name_control_chars();
     else if (name == "no_thread_for_dns")
         rc = no_thread_for_dns();
+    else if (name == "utf8_names")
+        utf8_names();
     else if (name == "v6_silent_first_hop")
         rc = v6_silent_first_hop();
     else if (name == "stop_before_start")
