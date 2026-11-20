@@ -75,3 +75,20 @@ if(OPENMTR_BUILD_FUZZERS)
     target_compile_options(fuzz_icmp PRIVATE -g -fsanitize=fuzzer,address,undefined)
     target_link_options(fuzz_icmp PRIVATE -fsanitize=fuzzer,address,undefined)
 endif()
+
+# ASN lookups (src/asn_resolver.cpp, src/asncache.cpp) without a network:
+# query names, TXT parsing, unroutable addresses, hand-made DNS answers, and
+# the cache's pending timeout with a stand-in lookup.
+add_executable(asn_parse_tests asn_parse_tests.cpp ${PROJECT_SOURCE_DIR}/src/asn_resolver.cpp
+               ${PROJECT_SOURCE_DIR}/src/asncache.cpp)
+set_target_properties(asn_parse_tests PROPERTIES AUTOMOC OFF)
+target_include_directories(asn_parse_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(asn_parse_tests PRIVATE ${OPENMTR_RESOLV_LIBS} Threads::Threads)
+if(WIN32)
+    target_link_libraries(asn_parse_tests PRIVATE ws2_32 dnsapi)
+endif()
+if(NOT MSVC)
+    target_compile_options(asn_parse_tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME asn_parse COMMAND asn_parse_tests)
+set_tests_properties(asn_parse PROPERTIES TIMEOUT 20)

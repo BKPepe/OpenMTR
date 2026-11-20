@@ -377,7 +377,9 @@ int cli::run(int argc, char** argv)
     };
 
     AsnCache asnCache;
-    const auto asnLookup = [&](const QString& ip, bool v6) { return asnCache.get(ip, v6); };
+    const auto asnLookup = [&](const QString& ip, bool v6) {
+        return QString::fromStdString(asnCache.get(ip.toStdString(), v6));
+    };
     Progress progress(stderrIsInteractive());
 
     // --- Phase 1: route discovery / warm-up ---------------------------
@@ -393,7 +395,7 @@ int cli::run(int argc, char** argv)
         // lookups run concurrently with route discovery.
         for (const auto& h : state)
             if (h.addr.Ipv4.sin_family != AF_UNSPEC)
-                asnCache.get(QString::fromStdWString(addr_to_wstring(h.addr)),
+                asnCache.get(QString::fromStdWString(addr_to_wstring(h.addr)).toStdString(),
                              h.addr.Ipv6.sin6_family == AF_INET6);
         progress.update(QString("Discovering route... (%1s)").arg(elapsedMs() / 1000));
         if (warmupRouteSettled(fp, state, checkHops, elapsedMs()))

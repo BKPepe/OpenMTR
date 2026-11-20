@@ -65,6 +65,37 @@ if(WIN32)
 endif()
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
+# ---- System resolver (ASN lookups, src/asn_resolver.cpp) ---------------------
+# res_query() and ns_initparse()/ns_parserr() are in the C library itself on
+# musl (OpenWrt), but in libresolv on glibc and macOS (where the ns_* names
+# are macros for libresolv's res_9_* symbols, hence a link test rather than
+# a symbol check). Windows uses DnsQuery_W (dnsapi) instead.
+set(OPENMTR_RESOLV_LIBS "")
+if(NOT WIN32)
+    include(CheckCXXSourceCompiles)
+    set(_openmtr_ns_test [=[
+        #include <sys/types.h>
+        #include <netinet/in.h>
+        #include <arpa/nameser.h>
+        #include <resolv.h>
+        int main() {
+            unsigned char answer[512];
+            ns_msg msg;
+            int n = res_query("example.", ns_c_in, ns_t_txt, answer, sizeof(answer));
+            return ns_initparse(answer, n, &msg);
+        }]=])
+    check_cxx_source_compiles("${_openmtr_ns_test}" OPENMTR_RESOLV_IN_LIBC)
+    if(NOT OPENMTR_RESOLV_IN_LIBC)
+        set(CMAKE_REQUIRED_LIBRARIES resolv)
+        check_cxx_source_compiles("${_openmtr_ns_test}" OPENMTR_RESOLV_IN_LIBRESOLV)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(NOT OPENMTR_RESOLV_IN_LIBRESOLV)
+            message(FATAL_ERROR "res_query()/ns_initparse() found neither in the C library nor in libresolv")
+        endif()
+        set(OPENMTR_RESOLV_LIBS resolv)
+    endif()
+endif()
+
 # ---- Tests -------------------------------------------------------------------
 if(OPENMTR_BUILD_TESTS)
     enable_testing()
@@ -125,6 +156,8 @@ qt_add_executable(OpenMTR
     src/report_core.h
     src/asncache.cpp
     src/asncache.h
+    src/asn_resolver.cpp
+    src/asn_resolver.h
     src/updatecheck.cpp
     src/updatecheck.h
     src/versioninfo.cpp
@@ -183,6 +216,7 @@ target_link_libraries(OpenMTR PRIVATE
 if(UNIX AND NOT APPLE)
     target_link_libraries(OpenMTR PRIVATE Qt6::DBus PkgConfig::XCB_SHAPE)
 endif()
+target_link_libraries(OpenMTR PRIVATE ${OPENMTR_RESOLV_LIBS})
 
 if(WIN32)
     target_link_libraries(OpenMTR PRIVATE

@@ -26,7 +26,8 @@ or how a report is formatted:
 |---|---|---|
 | `tracer.{h,cpp}` | The actual ICMP engine — `OpenMTRNet` (dispatch loop, per-hop state) and `OpenMTRNetWrapper` (threaded facade) | MainWindow (via wrapper) and cli.cpp (via wrapper) identically |
 | `report_core.{h,cpp}` | Turning an engine snapshot into display-ready rows; text/JSON/CSV formatting; warm-up/settling state machine (`warmupRouteSettled`, `dnsAndAsnSettled`) | MainWindow's table + Copy/Export; cli.cpp's `--report` output |
-| `asncache.{h,cpp}` | ASN lookup (Team Cymru DNS-TXT) with a background-thread cache, no Qt event loop required | MainWindow's table; cli.cpp |
+| `asn_resolver.{h,cpp}` | ASN lookup (Team Cymru DNS-TXT) through the system resolver: `res_query` + `ns_initparse`/`ns_parserr` from the C library (`res_n*` on macOS), `DnsQuery_W` on Windows — no external program | asncache.cpp |
+| `asncache.{h,cpp}` | Background ASN lookups (a thread per lookup, pending for at most 2 s) and their thread-safe cache, no Qt event loop required | MainWindow's table; cli.cpp |
 | `updatecheck.{h,cpp}` | GitHub release check via a `curl` subprocess, gated by one compile-time switch | MainWindow's About/badge; cli.cpp's startup notice |
 | `versioninfo.{h,cpp}` | The one-line version string (`"1.4.0 DEV (AMD64) · Qt 6.8.1"`) | MainWindow's About dialog; `--version` |
 

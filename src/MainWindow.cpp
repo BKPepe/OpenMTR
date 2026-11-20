@@ -2651,12 +2651,13 @@ void MainWindow::hideIconTooltip()
 //  ASN lookup
 // ==========================================================================
 
-// lookupASN()/isUnroutableForAsn() now live in asncache.h/.cpp (needed by
-// both the GUI and the CLI report mode). m_asnCache is an AsnCache — see
-// there for how the thread-safe caching/pending bookkeeping works.
+// The lookup itself lives in asn_resolver.h/.cpp and the cache in
+// asncache.h/.cpp (shared by the GUI and the CLI report mode). m_asnCache is
+// an AsnCache — see there for how the thread-safe caching/pending
+// bookkeeping works.
 QString MainWindow::getCachedASN(const QString& ip, bool ipv6) const
 {
-    return m_asnCache.get(ip, ipv6);
+    return QString::fromStdString(m_asnCache.get(ip.toStdString(), ipv6));
 }
 
 // ==========================================================================
@@ -2886,7 +2887,7 @@ void MainWindow::onWarmupEnd()
     auto state    = m_net->getCurrentState();
     int checkHops = std::min(maxHops, static_cast<int>(state.size()));
 
-    // Warm the ASN cache as addresses appear, so the HTTP lookups run
+    // Warm the ASN cache as addresses appear, so the DNS lookups run
     // concurrently with route discovery and are typically resolved by the
     // time the table is revealed.
     for (const auto& h : state)
