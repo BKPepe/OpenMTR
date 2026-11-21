@@ -238,6 +238,13 @@ struct OpenMTROptions {
     unsigned pingsize = 64;
     double   interval = 1.0;
     bool     useDNS   = true;
+
+    // Which ICMP socket the POSIX engine probes with (no effect on Windows).
+    // Auto: an unprivileged ping socket, and on Linux a raw socket when
+    // that is refused (root/CAP_NET_RAW) — see OpenMTRNet::PrepareSocket().
+    // PingOnly/RawOnly force one kind, for the tests.
+    enum class SocketMode { Auto, PingOnly, RawOnly };
+    SocketMode socketMode = SocketMode::Auto;
 };
 
 // Raw per-hop record kept inside OpenMTRNet: the hop's address (v4 and v6
@@ -421,11 +428,13 @@ private:
     int m_stopPipe[2] = {-1, -1};
 
     // The socket PrepareSocket() opened, waiting for DoTrace() to take it
-    // over (-1 when there is none), and the address family it is for.
+    // over (-1 when there is none), the address family it is for, and
+    // whether it is a raw socket.
     // DoTrace() closes the socket when the trace ends; the destructor closes
     // one that was prepared but never used.
-    int m_fd       = -1;
-    int m_fdFamily = AF_UNSPEC;
+    int  m_fd       = -1;
+    int  m_fdFamily = AF_UNSPEC;
+    bool m_fdRaw    = false;     // a raw socket (Linux fallback), not a ping socket
 #endif
 
     // Shared with the detached reverse-DNS workers — see DnsSink above.

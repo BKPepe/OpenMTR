@@ -51,13 +51,13 @@ This is the single most fragile, most-tested-empirically part of the
 codebase. Do not change wire-format or receive-path code without
 understanding why each platform branch exists.
 
-| Concern | Windows | Linux | macOS/BSD |
-|---|---|---|---|
-| API | `IcmpSendEcho2`/`Icmp6SendEcho2` | raw sendto/recvfrom on unprivileged ping socket | same as Linux |
-| Intermediate-hop errors (Time Exceeded, Unreachable) | in the reply buffer, same call | **socket error queue** (`IP_RECVERR`/`IPV6_RECVERR`, drained via `POLLERR`) — a plain `recvfrom()` never sees them | delivered to ordinary `recvfrom()`, no error queue needed |
-| Per-socket demux by echo id | N/A (per-hop handle) | kernel rewrites id to its own "port" and only delivers matching traffic | **no demultiplexing at all** — every open ICMP socket gets a copy of every inbound message; must filter by sequence number ourselves |
-| Receive buffer | N/A | default | `net.inet.raw.recvspace` defaults to **8KB** — an echo reply ≥ ~8133 bytes doesn't fit and silently drops (probes at large `--size` all "time out"); explicitly set `SO_RCVBUF` to 64KB |
-| Leading IP header on read | N/A | absent | present on some BSD kernels incl. macOS — stripped before reading the ICMP header at a fixed offset |
+| Concern | Windows | Linux | Linux raw fallback | macOS/BSD |
+|---|---|---|---|---|
+| API | `IcmpSendEcho2`/`Icmp6SendEcho2` | raw sendto/recvfrom on unprivileged ping socket | `SOCK_RAW` ICMP socket, only when the ping socket is refused (needs root/`CAP_NET_RAW`) | same as Linux |
+| Intermediate-hop errors (Time Exceeded, Unreachable) | in the reply buffer, same call | **socket error queue** (`IP_RECVERR`/`IPV6_RECVERR`, drained via `POLLERR`) — a plain `recvfrom()` never sees them | delivered to ordinary `recvfrom()`, no error queue | delivered to ordinary `recvfrom()`, no error queue needed |
+| Per-socket demux by echo id | N/A (per-hop handle) | kernel rewrites id to its own "port" and only delivers matching traffic | **none** — the socket sees every ICMP message the host receives (narrowed by `ICMP_FILTER`/`ICMP6_FILTER` to the types handled); filter by echo id, which goes out unrewritten | **no demultiplexing at all** — every open ICMP socket gets a copy of every inbound message; must filter by sequence number ourselves |
+| Receive buffer | N/A | default | default | `net.inet.raw.recvspace` defaults to **8KB** — an echo reply ≥ ~8133 bytes doesn't fit and silently drops (probes at large `--size` all "time out"); explicitly set `SO_RCVBUF` to 64KB |
+| Leading IP header on read | N/A | absent | present (IPv4) — stripped like macOS | present on some BSD kernels incl. macOS — stripped before reading the ICMP header at a fixed offset |
 
 **Why the Linux error queue matters**: without draining it, no intermediate
 hop is ever heard from — every row but the destination reads as a timeout,
@@ -73,6 +73,18 @@ everyone, root included) fails Start with `-1` and
 `lastError()`/`lastErrorText()` instead of a thread that ends silently.
 `OpenMTRNet::DoTrace()` still prepares a socket itself when called directly
 (as the engine tests do).
+
+**Linux raw-socket fallback**: when the ping socket is refused with
+`EACCES`/`EPERM`, `PrepareSocket()` opens a `SOCK_RAW` ICMP socket instead,
+which root may always do — so the engine works on systems that keep the
+kernel's `1 0` (OpenWrt runs everything as root and never widens it). The
+receive path is the same parser (`src/icmp_parse.h`) with macOS's two flags
+on (`filterEchoId`, `stripIpv4Header`) and no error queue; a kernel filter
+(`ICMP_FILTER`, `ICMP6_FILTER`) passes only echo replies and the error types
+the parser handles. The echo id is the process id, as before.
+`OpenMTROptions::socketMode` forces one kind of socket for the tests
+(`raw_socket`, `raw_fallback`, and `tests/netns/engine_topology.sh`, which
+traces a three-hop path built from network namespaces).
 
 **Why macOS needs its own echo-id filter** (`filterEchoId = true` on that
 platform, `false` on Linux): two concurrent traces (a second OpenMTR, `ping`,

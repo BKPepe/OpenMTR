@@ -127,6 +127,15 @@ Duration: 2:00
 | **macOS** | macOS 14.4 Sonoma or newer (Apple Silicon) |
 | **Linux** | Desktop Linux, x86_64 or aarch64, with glibc 2.43 or newer |
 
+On Linux, OpenMTR traces without root through unprivileged ICMP ("ping")
+sockets, which the kernel allows only to the groups in
+`net.ipv4.ping_group_range`. Most desktop distributions allow everyone
+(systemd sets `0 2147483647`); where the range is the kernel default `1 0`
+(containers, minimal systems), allow it with
+`sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"`, or run as root,
+where OpenMTR falls back to a raw ICMP socket. If neither works, Start shows
+why instead of tracing.
+
 ---
 
 ## Command-line report mode

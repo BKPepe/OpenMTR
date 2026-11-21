@@ -118,7 +118,9 @@ table of dashes with exit code 1 instead of the documented 4. Fixed by
 `OpenMTRNet::PrepareSocket()`, which opens and configures the socket on the
 caller's thread before the trace thread starts: `DoTrace()` now returns -1
 with `lastError()`/`lastErrorText()`, the GUI shows that text in a dialog
-and returns to idle, and the CLI prints it and exits with 4. The same change
+and returns to idle, and the CLI prints it and exits with 4. Root no longer
+needs the sysctl at all: a refused ping socket now falls back to a raw ICMP
+socket (see `docs/ENGINE_INTERNALS.md`). The `PrepareSocket()` change also
 made the CLI's Ctrl+C handler async-signal-safe (it only sets a lock-free
 flag now; it used to call `std::stop_source::request_stop()`).
 **Regression test**: `refused_socket`. It needs a refused socket, so it skips

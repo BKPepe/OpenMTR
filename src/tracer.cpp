@@ -13,6 +13,7 @@
 // ==========================================================================
 
 #include "tracer.h"
+#include "icmp_parse.h"
 #include <cstring>
 
 #ifdef _WIN32
@@ -176,10 +177,14 @@ OpenMTRNet::OpenMTRNet(const OpenMTROptions& options)
     if (!m_stopEvent)
         return;
 #else
-    // No persistent ICMP handle on POSIX: DoTrace() opens its own unprivileged
-    // ping socket (SOCK_DGRAM/IPPROTO_ICMP) per trace instead. Just probe
-    // whether the OS will hand out an IPv6 one.
+    // No persistent ICMP handle on POSIX: each trace opens its own ICMP
+    // socket instead (see PrepareSocket()). Just probe whether the OS will
+    // hand out an IPv6 one, the way PrepareSocket() would try it.
     int testSock = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+#ifdef __linux__
+    if (testSock < 0 && (errno == EACCES || errno == EPERM))
+        testSock = ::socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+#endif
     if (testSock >= 0) {
         hasIPv6 = true;
         ::close(testSock);
@@ -265,13 +270,50 @@ int OpenMTRNet::PrepareSocket(int family)
         ::close(m_fd);
         m_fd       = -1;
         m_fdFamily = AF_UNSPEC;
+        m_fdRaw    = false;
     }
 
-    const bool isV6 = (family == AF_INET6);
-    const int  fd   = isV6 ? ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
-                           : ::socket(AF_INET,  SOCK_DGRAM, IPPROTO_ICMP);
+    const bool isV6  = (family == AF_INET6);
+    const int  proto = isV6 ? static_cast<int>(IPPROTO_ICMPV6) : static_cast<int>(IPPROTO_ICMP);
+    const auto mode  = opts.socketMode;
+
+    // An unprivileged ping socket first: it needs no privileges where the
+    // system allows it (macOS always; Linux for the groups in
+    // net.ipv4.ping_group_range).
+    int  fd  = -1;
+    int  err = 0;
+    bool raw = false;
+    if (mode != OpenMTROptions::SocketMode::RawOnly) {
+        fd = ::socket(family, SOCK_DGRAM, proto);
+        if (fd < 0)
+            err = errno;
+    }
+#ifdef __linux__
+    // Refused: fall back to a raw ICMP socket, which root (or anything with
+    // CAP_NET_RAW) may always open — the two kinds of socket mtr-packet uses
+    // too (it tries raw first, as it starts privileged), and what busybox
+    // ping (raw only) relies on. This is what makes the engine
+    // work on a stock OpenWrt router, which runs everything as root and
+    // keeps the kernel's "1 0" ping_group_range. Raw sockets see every ICMP
+    // message the host receives, so DoTrace() then filters by echo id and
+    // checks quoted packets (see icmp_parse.h), and a kernel filter below
+    // drops all but the three types it handles.
+    if (fd < 0 && (mode == OpenMTROptions::SocketMode::RawOnly ||
+                   (mode == OpenMTROptions::SocketMode::Auto && (err == EACCES || err == EPERM)))) {
+        fd = ::socket(family, SOCK_RAW, proto);
+        if (fd >= 0)
+            raw = true;
+        else if (mode == OpenMTROptions::SocketMode::RawOnly)
+            err = errno;
+        // Auto: report the ping socket's error, not the raw one's — it is
+        // the one a user without root can do something about.
+    }
+#else
+    if (mode == OpenMTROptions::SocketMode::RawOnly)
+        err = EPROTONOSUPPORT;    // raw mode is implemented for Linux only
+#endif
     if (fd < 0)
-        return errno != 0 ? errno : EIO;
+        return err != 0 ? err : EIO;
 
     // Non-blocking is a hard requirement: the dispatch loop drains the
     // socket until EAGAIN, which on a blocking socket would park the whole
@@ -304,19 +346,46 @@ int OpenMTRNet::PrepareSocket(int family)
     // destination would read as a timeout and the app would look like a
     // plain ping pretending to be a traceroute. Better to stop with the
     // engine's own error path than to draw a confidently wrong route.
-    int recverr = 1;
-    const int recverrRc = isV6
-        ? ::setsockopt(fd, IPPROTO_IPV6, IPV6_RECVERR, &recverr, sizeof(recverr))
-        : ::setsockopt(fd, IPPROTO_IP,   IP_RECVERR,   &recverr, sizeof(recverr));
-    if (recverrRc < 0) {
-        const int err = errno;
-        ::close(fd);
-        return err != 0 ? err : EIO;
+    //
+    // A raw socket needs none of this: it receives the ICMP errors with
+    // recvfrom() like any other ICMP message.
+    if (!raw) {
+        int recverr = 1;
+        const int recverrRc = isV6
+            ? ::setsockopt(fd, IPPROTO_IPV6, IPV6_RECVERR, &recverr, sizeof(recverr))
+            : ::setsockopt(fd, IPPROTO_IP,   IP_RECVERR,   &recverr, sizeof(recverr));
+        if (recverrRc < 0) {
+            const int setErr = errno;
+            ::close(fd);
+            return setErr != 0 ? setErr : EIO;
+        }
+    } else if (isV6) {
+        // Kernel-side filter: only the ICMPv6 types the receive path handles
+        // reach the socket. A refusal is not fatal — the parser checks
+        // everything anyway; the filter only saves the work.
+        struct icmp6_filter filter;
+        ICMP6_FILTER_SETBLOCKALL(&filter);
+        ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filter);
+        ICMP6_FILTER_SETPASS(ICMP6_DST_UNREACH, &filter);
+        ICMP6_FILTER_SETPASS(ICMP6_PACKET_TOO_BIG, &filter);
+        ICMP6_FILTER_SETPASS(ICMP6_TIME_EXCEEDED, &filter);
+        ICMP6_FILTER_SETPASS(ICMP6_PARAM_PROB, &filter);
+        (void)::setsockopt(fd, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
+    } else {
+        // The IPv4 equivalent, ICMP_FILTER from <linux/icmp.h> (a set bit
+        // drops that type). Spelled out rather than included: that header
+        // clashes with <netinet/ip_icmp.h>.
+        constexpr int kSolRaw     = 255;   // SOL_RAW
+        constexpr int kIcmpFilter = 1;     // ICMP_FILTER
+        const uint32_t filter = ~((1u << icmpparse::kEchoReply) | (1u << icmpparse::kDestUnreach) |
+                                  (1u << icmpparse::kTimeExceeded));
+        (void)::setsockopt(fd, kSolRaw, kIcmpFilter, &filter, sizeof(filter));
     }
 #endif
 
     m_fd       = fd;
     m_fdFamily = family;
+    m_fdRaw    = raw;
     return 0;
 }
 
@@ -333,10 +402,12 @@ std::string OpenMTRSocketErrorText(int err, int family)
     // net.ipv4.ping_group_range (it covers ICMPv6 too). The kernel default,
     // "1 0", allows nobody, not even root; many distributions widen it, but
     // not all of them do, and containers and OpenWrt keep the default.
+    // When PrepareSocket() reports this, the raw-socket fallback has been
+    // tried as well and failed for want of privileges.
     if (err == EACCES || err == EPERM)
         text += " Unprivileged ping sockets are not allowed for this user's group by"
-                " net.ipv4.ping_group_range; allow them with:"
-                " sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"";
+                " net.ipv4.ping_group_range, and raw ICMP sockets need root (CAP_NET_RAW)."
+                " Allow ping sockets with: sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"";
 #endif
     return text;
 }
@@ -718,12 +789,19 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
     // unrewritten, so the id we sent is the id that comes back (in the outer
     // header of echo replies, in the quoted original packet of Time
     // Exceeded / Unreachable) — filter on it.
-    const bool filterEchoId = true;
+    const bool filterEchoIdDgram = true;
 #else
     // Linux rewrites the outgoing id to the socket's kernel-assigned "port"
     // and already delivers only matching traffic to this socket, so the id
     // we sent never appears on the wire and needs no checking here.
-    const bool filterEchoId = false;
+    const bool filterEchoIdDgram = false;
+#endif
+#ifdef __APPLE__
+    // Some BSD kernels (macOS included) hand an ICMP dgram socket each IPv4
+    // message with its IP header still in front; Linux ping sockets don't.
+    const bool stripIpv4HeaderDgram = true;
+#else
+    const bool stripIpv4HeaderDgram = false;
 #endif
 
     ULONGLONG intervalMs = static_cast<ULONGLONG>(opts.interval * 1000);
@@ -756,9 +834,23 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
             return;
         }
     }
-    const int fd = m_fd;     // this trace owns it from here on, and closes it
+    const int  fd      = m_fd;     // this trace owns it from here on, and closes it
+    const bool rawMode = m_fdRaw;
     m_fd       = -1;
     m_fdFamily = AF_UNSPEC;
+    m_fdRaw    = false;
+
+    // A raw socket (Linux, see PrepareSocket()) sees every ICMP message the
+    // host receives, IPv4 ones with their IP header, and our echo id goes
+    // out unrewritten — like a macOS ping socket, so the same two flags.
+    // ICMP errors arrive through recvfrom() then, not the error queue.
+    const bool filterEchoId    = rawMode || filterEchoIdDgram;
+    const bool stripIpv4Header = rawMode || stripIpv4HeaderDgram;
+#ifdef __linux__
+    const bool useErrQueue     = !rawMode;
+#else
+    const bool useErrQueue     = false;
+#endif
 
     // Per-hop schedule state — the POSIX equivalent of HopState above
     // (no OS-level wait handle, so nothing corresponding to hEvent).
@@ -905,46 +997,6 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         return hs.t0 + hs.slot * intervalMs;
     };
 
-    // Locate our quoted echo request inside an ICMPv6 error message (Time
-    // Exceeded / Destination Unreachable): skip the outer 8-byte ICMPv6
-    // header, then the quoted packet's 40-byte IPv6 header, then any
-    // extension headers in its Next Header chain. We never send extension
-    // headers ourselves, but tunnels and middleboxes can insert them into
-    // the quoted copy — a fixed +40 offset would then read garbage where
-    // the echo header was expected. Returns nullptr if the chain can't be
-    // walked to an ICMPv6 header within the buffer.
-    auto quotedIcmp6 = [](const char* buf, int len) -> const struct icmp6_hdr* {
-        int off = 8;
-        if (len < off + 40)
-            return nullptr;
-        uint8_t next = static_cast<uint8_t>(buf[off + 6]);   // IPv6 header's Next Header
-        off += 40;
-        while (next != IPPROTO_ICMPV6) {
-            // Every walkable extension header starts with Next Header and
-            // (except Fragment, fixed 8 bytes) its own length in 8-octet
-            // units excluding the first.
-            if (off + 8 > len)
-                return nullptr;
-            switch (next) {
-                case IPPROTO_HOPOPTS:
-                case IPPROTO_ROUTING:
-                case IPPROTO_DSTOPTS:
-                    next = static_cast<uint8_t>(buf[off]);
-                    off += (static_cast<uint8_t>(buf[off + 1]) + 1) * 8;
-                    break;
-                case IPPROTO_FRAGMENT:
-                    next = static_cast<uint8_t>(buf[off]);
-                    off += 8;
-                    break;
-                default:
-                    return nullptr;         // ESP/unknown — nothing we sent
-            }
-        }
-        if (off + static_cast<int>(sizeof(struct icmp6_hdr)) > len)
-            return nullptr;
-        return reinterpret_cast<const struct icmp6_hdr*>(buf + off);
-    };
-
     bool anyActive = true;
     char readBuf[2048];
 
@@ -1026,191 +1078,70 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
             break;
         }
 
-#ifndef __linux__
-        // macOS/BSD have no error queue, but poll() can still flag POLLERR
-        // (e.g. an asynchronous ENETUNREACH on the socket). Only the Linux
-        // block below ever reads it; on this platform the condition would
-        // persist and poll() would keep returning immediately — a busy loop
-        // pinning a core. Clear the pending error and move on.
-        if ((fds[1].revents & POLLERR) && !(fds[1].revents & POLLIN)) {
+        // Without an error queue (macOS/BSD, and Linux raw sockets) poll()
+        // can still flag POLLERR (e.g. an asynchronous ENETUNREACH on the
+        // socket). Only the error-queue block below ever reads it; here the
+        // condition would persist and poll() would keep returning
+        // immediately — a busy loop pinning a core. Clear the pending error
+        // and move on.
+        if (!useErrQueue && (fds[1].revents & POLLERR) && !(fds[1].revents & POLLIN)) {
             int soerr = 0;
             socklen_t slen = sizeof(soerr);
             ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
         }
-#endif
 
         if (fds[1].revents & POLLIN) {
             while (true) {
                 sockaddr_storage from = {};
                 socklen_t fromlen = sizeof(from);
-                int n = ::recvfrom(fd, readBuf, sizeof(readBuf), 0, reinterpret_cast<sockaddr*>(&from), &fromlen);
-                if (n < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK)
-                        break;
-                    break;
+                const ssize_t n = ::recvfrom(fd, readBuf, sizeof(readBuf), 0,
+                                             reinterpret_cast<sockaddr*>(&from), &fromlen);
+                if (n < 0)
+                    break;          // EAGAIN/EWOULDBLOCK: drained; anything else: give up for now
+
+                // Which probe (if any) this answers: see icmp_parse.h.
+                const uint8_t* pkt = reinterpret_cast<const uint8_t*>(readBuf);
+                const icmpparse::Match m = isV6
+                    ? icmpparse::parseIcmp6(pkt, static_cast<size_t>(n), filterEchoId, echoId)
+                    : icmpparse::parseIcmp4(pkt, static_cast<size_t>(n), stripIpv4Header, filterEchoId, echoId);
+                if (!m.valid || from.ss_family != (isV6 ? AF_INET6 : AF_INET))
+                    continue;   // not ours — must not clear another hop's pending probe
+
+                const int hopIndex = m.seq >> 11;
+                if (hopIndex >= MAX_HOPS)
+                    continue;
+                PosixHopState& hs = hops[hopIndex];
+                if (!hs.pending || hs.sentSeq != m.seq)
+                    continue;   // late reply to an earlier probe of this hop
+
+                const ULONGLONG nowRecv = GetTickCount64();
+                int rtt = static_cast<int>(nowRecv - hs.sentTime);
+                if (rtt <= 0) rtt = 1;
+                finish(hs);
+
+                // An echo reply (the destination) or Time Exceeded (a hop on
+                // the way) counts as an answer from the sender's address; any
+                // other error is that hop's status.
+                const bool answered = m.isReply ||
+                    m.type == (isV6 ? icmpparse::kV6TimeExceeded : icmpparse::kTimeExceeded);
+                if (!answered) {
+                    const DWORD errStatus = isV6 ? Icmp6StatusFor(m.type, m.code)
+                                                 : Icmp4StatusFor(m.type, m.code);
+                    SetErrorName(hopIndex, errStatus);
+                    RecordProbe(hopIndex, false, 0, errStatus);
+                    continue;
                 }
-
-                if (!isV6) {
-                    if (from.ss_family != AF_INET)
-                        continue;
-                    sockaddr_in* from_in = reinterpret_cast<sockaddr_in*>(&from);
-
-                    // On some BSD kernels (incl. macOS) a raw/dgram ICMP read
-                    // still carries the leading IPv4 header; on Linux it
-                    // doesn't. Strip it if present before reading the ICMP
-                    // header at a fixed offset.
-                    int ip_hdr_len = 0;
-#ifdef __APPLE__
-                    if (n >= 20) {
-                        unsigned char ip_first_byte = (unsigned char)readBuf[0];
-                        ip_hdr_len = (ip_first_byte & 0x0F) * 4;
-                    }
-#endif
-                    int icmp_len = n - ip_hdr_len;
-                    // Complete echo header is ICMP_MINLEN (8) bytes;
-                    // sizeof(struct icmp) is 28 and would drop legitimately
-                    // short ICMP messages.
-                    if (icmp_len < ICMP_MINLEN)
-                        continue;
-                    struct icmp* icmp = reinterpret_cast<struct icmp*>(readBuf + ip_hdr_len);
-                    uint16_t seq  = 0;
-                    bool valid    = false;
-                    bool isReply  = false;
-
-                    if (icmp->icmp_type == ICMP_ECHOREPLY) {
-                        // Not ours (see filterEchoId above) — skip, don't
-                        // let it clear another hop's pending probe.
-                        if (filterEchoId && ntohs(icmp->icmp_id) != echoId)
-                            continue;
-                        seq     = ntohs(icmp->icmp_seq);
-                        isReply = true;
-                        valid   = true;
-                    } else if (icmp->icmp_type == ICMP_TIMXCEED) {
-                        // Time Exceeded carries the original request's IP+ICMP
-                        // header, embedded 8 bytes into the payload; that's
-                        // where the matching sequence number comes from.
-                        if (icmp_len >= 8 + 20 + 8) {
-                            unsigned char ip_first_byte = static_cast<unsigned char>(readBuf[ip_hdr_len + 8]);
-                            int inner_ip_hdr_len = (ip_first_byte & 0x0F) * 4;
-                            if (inner_ip_hdr_len >= 20 && icmp_len >= 8 + inner_ip_hdr_len + 8) {
-                                struct icmp* inner_icmp =
-                                    reinterpret_cast<struct icmp*>(readBuf + ip_hdr_len + 8 + inner_ip_hdr_len);
-                                // The quoted original packet is our own echo
-                                // request — its id says whose probe expired.
-                                if (filterEchoId && ntohs(inner_icmp->icmp_id) != echoId)
-                                    continue;
-                                seq   = ntohs(inner_icmp->icmp_seq);
-                                valid = true;
-                            }
-                        }
-                    } else if (icmp->icmp_type == ICMP_UNREACH) {
-                        if (icmp_len >= 8 + 20 + 8) {
-                            unsigned char ip_first_byte = static_cast<unsigned char>(readBuf[ip_hdr_len + 8]);
-                            int inner_ip_hdr_len = (ip_first_byte & 0x0F) * 4;
-                            if (inner_ip_hdr_len >= 20 && icmp_len >= 8 + inner_ip_hdr_len + 8) {
-                                struct icmp* inner_icmp =
-                                    reinterpret_cast<struct icmp*>(readBuf + ip_hdr_len + 8 + inner_ip_hdr_len);
-                                // The quoted original packet is our own echo
-                                // request — its id says whose probe expired.
-                                if (filterEchoId && ntohs(inner_icmp->icmp_id) != echoId)
-                                    continue;
-                                seq   = ntohs(inner_icmp->icmp_seq);
-                                valid = true;
-                            }
-                        }
-                    }
-
-                    if (valid) {
-                        int hopIndex = seq >> 11;
-                        if (hopIndex >= 0 && hopIndex < MAX_HOPS) {
-                            PosixHopState& hs = hops[hopIndex];
-                            if (hs.pending && (hs.sentSeq == seq)) {
-                                ULONGLONG nowRecv = GetTickCount64();
-                                int rtt = static_cast<int>(nowRecv - hs.sentTime);
-                                if (rtt <= 0) rtt = 1;
-                                finish(hs);
-
-                                if (isReply || icmp->icmp_type == ICMP_TIMXCEED) {
-                                    RecordProbe(hopIndex, true, rtt);
-                                    SetAddr(hopIndex, from_in->sin_addr.s_addr);
-                                } else {
-                                    const DWORD errStatus =
-                                        Icmp4StatusFor(icmp->icmp_type, icmp->icmp_code);
-                                    SetErrorName(hopIndex, errStatus);
-                                    RecordProbe(hopIndex, false, 0, errStatus);
-                                }
-                            }
-                        }
-                    }
+                RecordProbe(hopIndex, true, rtt);
+                if (isV6) {
+                    const sockaddr_in6* from_in6 = reinterpret_cast<const sockaddr_in6*>(&from);
+                    IPV6_ADDRESS_EX addrex = {};
+                    addrex.sin6_port     = from_in6->sin6_port;
+                    addrex.sin6_flowinfo = from_in6->sin6_flowinfo;
+                    addrex.sin6_scope_id = from_in6->sin6_scope_id;
+                    std::memcpy(addrex.sin6_addr, &from_in6->sin6_addr, 16);
+                    SetAddr6(hopIndex, addrex);
                 } else {
-                    if (from.ss_family != AF_INET6)
-                        continue;
-                    sockaddr_in6* from_in6 = reinterpret_cast<sockaddr_in6*>(&from);
-
-                    if (n < static_cast<int>(sizeof(struct icmp6_hdr)))
-                        continue;
-                    struct icmp6_hdr* icmp6 = reinterpret_cast<struct icmp6_hdr*>(readBuf);
-                    uint16_t seq  = 0;
-                    bool valid    = false;
-                    bool isReply  = false;
-
-                    if (icmp6->icmp6_type == ICMP6_ECHO_REPLY) {
-                        // Not ours (see filterEchoId above) — skip.
-                        if (filterEchoId && ntohs(icmp6->icmp6_id) != echoId)
-                            continue;
-                        seq     = ntohs(icmp6->icmp6_seq);
-                        isReply = true;
-                        valid   = true;
-                    } else if (icmp6->icmp6_type == ICMP6_TIME_EXCEEDED) {
-                        if (const struct icmp6_hdr* inner_icmp6 = quotedIcmp6(readBuf, n)) {
-                            // Quoted original packet — check whose probe it was.
-                            if (filterEchoId && ntohs(inner_icmp6->icmp6_id) != echoId)
-                                continue;
-                            seq   = ntohs(inner_icmp6->icmp6_seq);
-                            valid = true;
-                        }
-                    } else if (icmp6->icmp6_type == ICMP6_DST_UNREACH ||
-                               icmp6->icmp6_type == ICMP6_PACKET_TOO_BIG ||
-                               icmp6->icmp6_type == ICMP6_PARAM_PROB) {
-                        // Every ICMPv6 error quotes the packet that caused
-                        // it, so one branch matches them all. Packet Too Big
-                        // and Parameter Problem used to be ignored outright,
-                        // which surfaced as a plain timeout.
-                        if (const struct icmp6_hdr* inner_icmp6 = quotedIcmp6(readBuf, n)) {
-                            if (filterEchoId && ntohs(inner_icmp6->icmp6_id) != echoId)
-                                continue;
-                            seq   = ntohs(inner_icmp6->icmp6_seq);
-                            valid = true;
-                        }
-                    }
-
-                    if (valid) {
-                        int hopIndex = seq >> 11;
-                        if (hopIndex >= 0 && hopIndex < MAX_HOPS) {
-                            PosixHopState& hs = hops[hopIndex];
-                            if (hs.pending && (hs.sentSeq == seq)) {
-                                ULONGLONG nowRecv = GetTickCount64();
-                                int rtt = static_cast<int>(nowRecv - hs.sentTime);
-                                if (rtt <= 0) rtt = 1;
-                                finish(hs);
-
-                                if (isReply || icmp6->icmp6_type == ICMP6_TIME_EXCEEDED) {
-                                    RecordProbe(hopIndex, true, rtt);
-                                    IPV6_ADDRESS_EX addrex = {};
-                                    addrex.sin6_port     = from_in6->sin6_port;
-                                    addrex.sin6_flowinfo = from_in6->sin6_flowinfo;
-                                    addrex.sin6_scope_id  = from_in6->sin6_scope_id;
-                                    std::memcpy(addrex.sin6_addr, &from_in6->sin6_addr, 16);
-                                    SetAddr6(hopIndex, addrex);
-                                } else {
-                                    const DWORD errStatus = Icmp6StatusFor(
-                                        icmp6->icmp6_type, icmp6->icmp6_code);
-                                    SetErrorName(hopIndex, errStatus);
-                                    RecordProbe(hopIndex, false, 0, errStatus);
-                                }
-                            }
-                        }
-                    }
+                    SetAddr(hopIndex, reinterpret_cast<const sockaddr_in*>(&from)->sin_addr.s_addr);
                 }
             }
         }
@@ -1223,10 +1154,15 @@ void OpenMTRNet::DoTrace(sockaddr* dest)
         // Without this block every intermediate hop just silently "times
         // out" and only the final Echo Reply (via recvfrom) is ever seen,
         // which looks exactly like a plain ping instead of a traceroute.
-        if (fds[1].revents & POLLERR) {
+        if (useErrQueue && (fds[1].revents & POLLERR)) {
             while (true) {
-                unsigned char errBuf[512];
-                char ctrl[512];
+                // Aligned for what is read out of them: CMSG_FIRSTHDR() hands
+                // back `ctrl` as a struct cmsghdr, and the quoted probe in
+                // `errBuf` is read through struct icmp. A plain char array
+                // has no such alignment, which strict-alignment CPUs (MIPS,
+                // as in many routers) trap on or emulate slowly.
+                alignas(8) unsigned char errBuf[512];
+                alignas(struct cmsghdr) char ctrl[512];
                 sockaddr_storage from = {};
                 struct iovec iov = { errBuf, sizeof(errBuf) };
                 struct msghdr msg = {};

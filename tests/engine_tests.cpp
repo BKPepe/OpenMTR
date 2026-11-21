@@ -15,6 +15,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #ifdef __linux__
 #include <sys/resource.h>
@@ -349,15 +350,34 @@ static int stop_right_after_start()
     return 0;
 }
 
+// Whether this process may open a raw ICMP socket (Linux: root or
+// CAP_NET_RAW) — the engine's fallback when ping sockets are refused.
+static bool rawSocketAvailable(int family)
+{
+#ifdef __linux__
+    const int proto = family == AF_INET6 ? static_cast<int>(IPPROTO_ICMPV6)
+                                         : static_cast<int>(IPPROTO_ICMP);
+    const int fd = ::socket(family, SOCK_RAW, proto);
+    if (fd < 0)
+        return false;
+    ::close(fd);
+    return true;
+#else
+    (void)family;
+    return false;
+#endif
+}
+
 // A refused ICMP socket must fail DoTrace() at once, with the errno and a
 // readable reason, instead of starting a trace thread that ends silently and
 // leaves every hop empty (the Linux default net.ipv4.ping_group_range, "1 0",
-// refuses even root). Only runnable where the socket is refused: CI runs it
-// in a fresh network namespace, which always starts out with "1 0".
+// refuses even root). Only runnable where both kinds of socket are refused:
+// CI runs it as an unprivileged user in a fresh network namespace, which
+// always starts out with "1 0".
 static int refused_socket()
 {
-    if (pingSocketAvailable(AF_INET)) {
-        std::printf("skipped: unprivileged ICMP sockets are allowed here\n");
+    if (pingSocketAvailable(AF_INET) || rawSocketAvailable(AF_INET)) {
+        std::printf("skipped: an ICMP socket can be opened here\n");
         return 77;
     }
     struct Options : IOpenMTROptionsProvider {
@@ -376,6 +396,136 @@ static int refused_socket()
 #ifdef __linux__
     CHECK(trace.lastErrorText().find("ping_group_range") != std::string::npos);
 #endif
+    return 0;
+}
+
+// Traces the loopback address with `mode` until hop 1 has answered a few
+// probes (or 6 s pass) and checks the hop: the whole receive path of that
+// socket kind, end to end, without needing a network.
+static void traceLoopback(OpenMTROptions::SocketMode mode)
+{
+    OpenMTROptions o;
+    o.useDNS     = false;
+    o.socketMode = mode;
+    OpenMTRNet net(o);
+    const int err = net.PrepareSocket(AF_INET);
+    CHECK(err == 0);
+    if (err != 0)
+        return;
+    sockaddr_in dest = loopback4();
+    std::thread trace([&] { net.DoTrace(reinterpret_cast<sockaddr*>(&dest)); });
+    const auto t0 = std::chrono::steady_clock::now();
+    while (net.GetHopSnapshot(0).returned < 3
+           && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(6))
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto hop = net.GetHopSnapshot(0);
+    std::printf("hop 1: sent %d, answered %d, alternates %d, anomalies %d\n",
+                hop.xmit, hop.returned, hop.altCount, hop.anomalyCount);
+    CHECK(hop.returned >= 3);
+    CHECK(hop.addr.Ipv4.sin_family == AF_INET);
+    CHECK(hop.addr.Ipv4.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    CHECK(hop.altCount == 0 && hop.anomalyCount == 0);
+    CHECK(net.GetMax() == 1);
+    net.StopTrace();
+    trace.join();
+}
+
+// Linux raw-socket mode, forced: our own echo replies must be recognised
+// among everything a raw socket receives (on loopback that includes our
+// outgoing requests themselves).
+static int raw_socket()
+{
+    if (!rawSocketAvailable(AF_INET)) {
+        std::printf("skipped: no raw ICMP socket here (needs root or CAP_NET_RAW)\n");
+        return 77;
+    }
+    traceLoopback(OpenMTROptions::SocketMode::RawOnly);
+    return 0;
+}
+
+// The automatic fallback: ping sockets refused, raw sockets allowed — root on
+// a stock OpenWrt, or root in a fresh network namespace (how CI runs it).
+static int raw_fallback()
+{
+    if (pingSocketAvailable(AF_INET) || !rawSocketAvailable(AF_INET)) {
+        std::printf("skipped: needs ping sockets refused and raw sockets allowed\n");
+        return 77;
+    }
+    traceLoopback(OpenMTROptions::SocketMode::Auto);
+    return 0;
+}
+
+static std::string addrText(const SOCKADDR_INET& a)
+{
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (a.Ipv4.sin_family == AF_INET)
+        inet_ntop(AF_INET, &a.Ipv4.sin_addr, buf, sizeof(buf));
+    else if (a.Ipv6.sin6_family == AF_INET6)
+        inet_ntop(AF_INET6, &a.Ipv6.sin6_addr, buf, sizeof(buf));
+    return buf;
+}
+
+// Not a ctest case: tests/netns/engine_topology.sh runs it inside the test
+// network of tests/netns/topo.sh, where the route to <dest> is known.
+//   engine_tests topology <auto|raw|ping> <dest> <hop 1> <hop 2> ...
+// Traces <dest> with that socket mode until every expected hop has
+// answered twice (at most 20 s), then checks the hops and the route length.
+static int topology(int argc, char** argv)
+{
+    if (argc < 5) {
+        std::printf("usage: engine_tests topology <auto|raw|ping> <dest> <hop>...\n");
+        return 2;
+    }
+    const std::string modeName = argv[2];
+    OpenMTROptions o;
+    o.useDNS     = false;
+    o.socketMode = modeName == "raw"  ? OpenMTROptions::SocketMode::RawOnly
+                 : modeName == "ping" ? OpenMTROptions::SocketMode::PingOnly
+                                      : OpenMTROptions::SocketMode::Auto;
+    std::vector<std::string> expected(argv + 4, argv + argc);
+
+    sockaddr_storage dest{};
+    auto* d4 = reinterpret_cast<sockaddr_in*>(&dest);
+    auto* d6 = reinterpret_cast<sockaddr_in6*>(&dest);
+    if (inet_pton(AF_INET, argv[3], &d4->sin_addr) == 1) {
+        d4->sin_family = AF_INET;
+    } else if (inet_pton(AF_INET6, argv[3], &d6->sin6_addr) == 1) {
+        d6->sin6_family = AF_INET6;
+    } else {
+        std::printf("not an address: %s\n", argv[3]);
+        return 2;
+    }
+
+    OpenMTRNet net(o);
+    const int err = net.PrepareSocket(dest.ss_family);
+    if (err != 0) {
+        std::printf("FAIL: %s\n", OpenMTRSocketErrorText(err, dest.ss_family).c_str());
+        return 1;
+    }
+    std::thread trace([&] { net.DoTrace(reinterpret_cast<sockaddr*>(&dest)); });
+    const auto t0 = std::chrono::steady_clock::now();
+    auto allAnswered = [&] {
+        for (size_t i = 0; i < expected.size(); ++i)
+            if (net.GetHopSnapshot(static_cast<int>(i)).returned < 2)
+                return false;
+        return true;
+    };
+    while (!allAnswered() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(20))
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const auto hop = net.GetHopSnapshot(static_cast<int>(i));
+        const std::string got = addrText(hop.addr);
+        std::printf("hop %zu: %-16s sent %d, answered %d, alternates %d, anomalies %d\n",
+                    i + 1, got.c_str(), hop.xmit, hop.returned, hop.altCount, hop.anomalyCount);
+        CHECK(got == expected[i]);
+        CHECK(hop.returned >= 2);
+        CHECK(hop.altCount == 0);
+    }
+    std::printf("route length %d (expected %zu)\n", net.GetMax(), expected.size());
+    CHECK(net.GetMax() == static_cast<int>(expected.size()));
+    net.StopTrace();
+    trace.join();
     return 0;
 }
 
@@ -401,6 +551,12 @@ int main(int argc, char** argv)
         rc = stop_right_after_start();
     else if (name == "refused_socket")
         rc = refused_socket();
+    else if (name == "raw_socket")
+        rc = raw_socket();
+    else if (name == "raw_fallback")
+        rc = raw_fallback();
+    else if (name == "topology")
+        rc = topology(argc, argv);
     else {
         std::printf("unknown case \"%s\"\n", name.c_str());
         return 2;

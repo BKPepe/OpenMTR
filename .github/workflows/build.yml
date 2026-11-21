@@ -721,7 +721,7 @@ jobs:
   #  Linux core tests: the Qt-free core on glibc and musl
   # ==========================================================================
   # Builds without the window app (-DOPENMTR_BUILD_GUI=OFF: no Qt to build,
-  # so this job is quick) and runs the tests three ways:
+  # so this job is quick) and runs the tests in these ways:
   #   - unprivileged on the runner (glibc). systemd's ping_group_range lets
   #     the runner user open ICMP ping sockets, so the Linux receive path
   #     (the IP_RECVERR error queue) runs here — the macOS job cannot cover
@@ -730,6 +730,8 @@ jobs:
   #     starts with net.ipv4.ping_group_range at the kernel default "1 0",
   #     where no one may open a ping socket, so refused_socket runs instead
   #     of skipping;
+  #   - the same as root, where the engine falls back to a raw socket;
+  #   - across a three-hop network of namespaces (tests/netns/topo.sh);
   #   - in an Alpine container: musl libc, as on OpenWrt.
   core-linux:
     runs-on: ubuntu-26.04
@@ -761,6 +763,21 @@ jobs:
               ctest --test-dir build --output-on-failure -R "^engine\."
           ' "$(id -u)" "$(id -g)"
 
+      - name: Tests (glibc, fresh network namespace, root)
+        # Ping sockets refused, raw sockets allowed: the engine's raw-socket
+        # fallback, as on a stock OpenWrt (raw_socket, raw_fallback).
+        run: |
+          sudo unshare --net sh -ec '
+            ip link set lo up
+            ctest --test-dir build --output-on-failure -R "^engine\."
+          '
+
+      - name: Three-hop trace in network namespaces (raw sockets and ping sockets)
+        # tests/netns/topo.sh builds client - r1 - r2 - dest; the engine
+        # must find exactly those hops, for IPv4 and IPv6, through a raw
+        # socket (root, ping sockets refused) and through a ping socket.
+        run: sudo tests/netns/engine_topology.sh build/tests/engine_tests
+
       - name: Build and tests (musl, Alpine)
         run: |
           docker run --rm -v "$PWD:/src:ro" alpine:3.22 sh -ec '
@@ -770,3 +787,38 @@ jobs:
             cmake --build /tmp/build --parallel
             ctest --test-dir /tmp/build --output-on-failure --no-tests=error
           '
+
+  # ==========================================================================
+  #  Sanitizers and fuzzing: the Qt-free core under ASan + UBSan
+  # ==========================================================================
+  # The same tests as core-linux, built with clang's AddressSanitizer and
+  # UndefinedBehaviorSanitizer (any finding fails the test), then a minute
+  # of libFuzzer on the ICMP receive-path parsers (src/icmp_parse.h), which
+  # read packets from anyone on the network.
+  sanitizers:
+    runs-on: ubuntu-26.04
+    name: Sanitizers and fuzzing (Linux)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Install clang
+        # Not --no-install-recommends: the sanitizer and libFuzzer runtimes
+        # (libclang-rt-*-dev) come in as clang's recommends.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build
+
+      - name: Build with ASan + UBSan
+        run: |
+          CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_BUILD_TESTS=ON -DOPENMTR_BUILD_FUZZERS=ON \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          cmake --build build --parallel
+
+      - name: Tests under the sanitizers
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Fuzz the ICMP parsers for 60 s
+        run: build/tests/fuzz_icmp -max_total_time=60 -print_final_stats=1

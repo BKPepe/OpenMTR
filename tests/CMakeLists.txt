@@ -19,7 +19,8 @@ if(NOT MSVC)
 endif()
 
 foreach(name IN ITEMS dns_lifetime status_text v6_silent_first_hop
-                      stop_before_start stop_right_after_start refused_socket)
+                      stop_before_start stop_right_after_start refused_socket
+                      raw_socket raw_fallback)
     add_test(NAME engine.${name} COMMAND engine_tests ${name})
     # A regression here can hang rather than crash, so bound every case.
     # 77 = this machine cannot run the case (e.g. no IPv6 ICMP socket):
@@ -50,4 +51,27 @@ if(TARGET Qt6::Core)
     add_test(NAME report.golden
              COMMAND report_golden_tests check ${CMAKE_CURRENT_SOURCE_DIR}/golden)
     set_tests_properties(report.golden PROPERTIES TIMEOUT 20)
+endif()
+
+# ICMP receive-path parsers (src/icmp_parse.h) against hand-made packets.
+add_executable(icmp_parse_tests icmp_parse_tests.cpp)
+set_target_properties(icmp_parse_tests PROPERTIES AUTOMOC OFF)
+target_include_directories(icmp_parse_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if(NOT MSVC)
+    target_compile_options(icmp_parse_tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME icmp_parse COMMAND icmp_parse_tests)
+set_tests_properties(icmp_parse PROPERTIES TIMEOUT 60)
+
+# libFuzzer target for the same parsers (clang only; see tests/fuzz/).
+option(OPENMTR_BUILD_FUZZERS "Build the libFuzzer targets in tests/fuzz/ (clang)" OFF)
+if(OPENMTR_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "OPENMTR_BUILD_FUZZERS needs clang (libFuzzer)")
+    endif()
+    add_executable(fuzz_icmp fuzz/fuzz_icmp.cpp)
+    set_target_properties(fuzz_icmp PROPERTIES AUTOMOC OFF)
+    target_include_directories(fuzz_icmp PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_options(fuzz_icmp PRIVATE -g -fsanitize=fuzzer,address,undefined)
+    target_link_options(fuzz_icmp PRIVATE -fsanitize=fuzzer,address,undefined)
 endif()
