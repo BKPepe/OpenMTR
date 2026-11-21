@@ -122,7 +122,8 @@ and returns to idle, and the CLI prints it and exits with 4. The same change
 made the CLI's Ctrl+C handler async-signal-safe (it only sets a lock-free
 flag now; it used to call `std::stop_source::request_stop()`).
 **Regression test**: `refused_socket`. It needs a refused socket, so it skips
-wherever one opens; an unprivileged user in a fresh network namespace gets one.
+wherever one opens; an unprivileged user in a fresh network namespace gets one,
+which is how the core-linux CI job runs it.
 
 ### "Finishing..." progress line running into the report on stdout
 `Progress`'s line-clear only happened in its destructor, which fires at

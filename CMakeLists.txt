@@ -16,18 +16,30 @@ cmake_minimum_required(VERSION 3.25)
 # instead of showing a clean "requires macOS 14.4" dialog. The CI job
 # re-checks this against every binary it ships (see
 # .github/workflows/build.yml).
-if(APPLE)
+#
+# Only for the window app: a build without it (-DOPENMTR_BUILD_GUI=OFF, see
+# below) has no Qt to match, so it keeps the toolchain's own architecture
+# and deployment target.
+if(APPLE AND (NOT DEFINED OPENMTR_BUILD_GUI OR OPENMTR_BUILD_GUI))
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum OS X version" FORCE)
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Build architectures" FORCE)
 endif()
 
 project(OpenMTR VERSION 1.4.0 LANGUAGES CXX)
 
-# ---- Language & Qt code generation -----------------------------------------
+# ---- Language ----------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
+
+# ---- Build options -----------------------------------------------------------
+# The window app is the default and only shipped artifact. OFF builds without
+# Qt at all: what remains is the Qt-free core (the engine in tracer.cpp) and
+# the tests for it, which is how CI tests the core on Linux (glibc and musl)
+# without building Qt there.
+option(OPENMTR_BUILD_GUI   "Build the Qt Widgets application (OpenMTR)" ON)
+# Off by default, so a normal build is unchanged. CI turns it on in build
+# directories of their own (see .github/workflows/build.yml).
+option(OPENMTR_BUILD_TESTS "Build the tests in tests/"                  OFF)
 
 # ---- Generated version header ----------------------------------------------
 # Written to the build dir so the sources can #include "version.h".
@@ -52,6 +64,23 @@ if(WIN32)
     )
 endif()
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
+
+# ---- Tests -------------------------------------------------------------------
+if(OPENMTR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+# ============================================================================
+#  The window app (OPENMTR_BUILD_GUI) — everything below needs Qt
+# ============================================================================
+if(NOT OPENMTR_BUILD_GUI)
+    return()
+endif()
+
+# Qt code generation (moc for Q_OBJECT classes, rcc for resources.qrc).
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 # ---- Dependencies ----------------------------------------------------------
 # No Qt6Network: the one-shot GitHub release check (MainWindow::
@@ -411,13 +440,4 @@ if(MSVC)
     # even though the .pdb itself is never distributed. %_PDB% collapses
     # that embedded path down to just the bare filename.
     target_link_options(OpenMTR PRIVATE /PDBALTPATH:%_PDB%)
-endif()
-
-# ---- Tests -------------------------------------------------------------------
-# Off by default, so a normal build is unchanged. CI turns it on for macOS in
-# a build directory of its own (see .github/workflows/build.yml).
-option(OPENMTR_BUILD_TESTS "Build the engine tests in tests/" OFF)
-if(OPENMTR_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
 endif()

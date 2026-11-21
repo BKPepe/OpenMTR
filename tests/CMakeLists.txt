@@ -4,12 +4,13 @@
 #   cmake --build build --target engine_tests
 #   ctest --test-dir build --output-on-failure
 #
-# CI runs them on macOS. They have also been built and run on Linux (GCC 14,
-# in a container), but never on Windows.
+# They need no Qt, so -DOPENMTR_BUILD_GUI=OFF builds them without it. CI runs
+# them on macOS and on Linux (glibc and musl, see the core-linux job), never
+# yet on Windows.
 find_package(Threads REQUIRED)
 
 add_executable(engine_tests engine_tests.cpp ${PROJECT_SOURCE_DIR}/src/tracer.cpp)
-# The project turns AUTOMOC on globally; nothing here is a Qt class.
+# Nothing here is a Qt class (the GUI section turns AUTOMOC on after this).
 set_target_properties(engine_tests PROPERTIES AUTOMOC OFF)
 target_include_directories(engine_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(engine_tests PRIVATE Threads::Threads)
@@ -31,3 +32,22 @@ foreach(name IN ITEMS icmp_checksum name_control_chars no_thread_for_dns)
     add_test(NAME engine.${name} COMMAND engine_tests ${name})
     set_tests_properties(engine.${name} PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 endforeach()
+
+# Report format golden files (tests/golden/): report_core's builders, byte
+# for byte. report_core still uses QtCore, so this is built only where a Qt
+# is found (it needs no display); the Qt-free Linux CI job skips it.
+find_package(Qt6 QUIET COMPONENTS Core)
+if(TARGET Qt6::Core)
+    add_executable(report_golden_tests report_golden_tests.cpp
+                   ${PROJECT_SOURCE_DIR}/src/report_core.cpp
+                   ${PROJECT_SOURCE_DIR}/src/tracer.cpp)
+    set_target_properties(report_golden_tests PROPERTIES AUTOMOC OFF)
+    target_include_directories(report_golden_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(report_golden_tests PRIVATE Qt6::Core Threads::Threads)
+    if(NOT MSVC)
+        target_compile_options(report_golden_tests PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME report.golden
+             COMMAND report_golden_tests check ${CMAKE_CURRENT_SOURCE_DIR}/golden)
+    set_tests_properties(report.golden PROPERTIES TIMEOUT 20)
+endif()

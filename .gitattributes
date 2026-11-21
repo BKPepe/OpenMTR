@@ -5,3 +5,8 @@
 # project's headers are all C++, so tell Linguist that outright rather than
 # leaving it to guess per file.
 *.h linguist-language=C++
+
+# Report golden files are compared byte for byte (tests/report_golden_tests.cpp)
+# and deliberately contain a TAB, control characters and non-ASCII text: no
+# line-ending conversion or diff/merge as text, on any platform.
+tests/golden/* -text

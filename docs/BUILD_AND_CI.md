@@ -139,10 +139,24 @@ distro-packaged ELF.
 window) via `-DOPENMTR_BUILD_TESTS=ON` into its own build directory (`ctest
 --test-dir build-tests`, kept entirely separate from the app's own `build/`
 so the two never interfere). `AUTOMOC` is explicitly turned off for this
-target since nothing in it is a Qt class. Currently run in CI on the macOS
-job only. `engine_tests` reports genuinely-unavailable-environment cases
-(no ICMP socket permission) as **skipped** via `SKIP_RETURN_CODE 77`, not
-silently passed.
+target since nothing in it is a Qt class. `engine_tests` reports
+genuinely-unavailable-environment cases (no ICMP socket permission) as
+**skipped** via `SKIP_RETURN_CODE 77`, not silently passed.
+`report_golden_tests` compares the text/JSON/CSV reports with
+`tests/golden/` byte for byte; it still links QtCore, so it is built only
+where a Qt is found.
+
+`-DOPENMTR_BUILD_GUI=OFF` leaves the window app out entirely, and with it
+`find_package(Qt6)`: the core and its tests then build with nothing but a
+C++20 compiler. CI runs the tests in two places:
+
+- **macOS job**: engine and golden tests, against the static Qt it builds
+  anyway.
+- **`core-linux` job**: `-DOPENMTR_BUILD_GUI=OFF`, three runs — unprivileged
+  on the Ubuntu runner (ping sockets allowed, so the Linux `IP_RECVERR`
+  receive path runs), in a fresh network namespace as the runner user
+  (`ping_group_range` is the kernel default `1 0` there, so the
+  refused-socket path runs), and in an Alpine container (musl).
 
 ## Artifact shape (what CI uploads)
 
