@@ -4,9 +4,10 @@
 
 #pragma once
 
-#include <QtCore/QString>
+#include <string>
 
-// "1.4.0 DEV (AMD64) · Qt 6.8.1" — used identically by MainWindow's About
-// dialog and the CLI's --version, so the two can never show different text
-// for the same build.
-QString openMtrVersionLine();
+// "1.4.0 (AMD64)": the version and the CPU architecture it was built for;
+// in the window app with its Qt version appended ("1.4.0 (AMD64) · Qt
+// 6.12.0"). Used identically by MainWindow's About dialog and `--version`,
+// so the two can never show different text for the same build.
+std::string openMtrVersionLine();

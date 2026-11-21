@@ -2303,7 +2303,7 @@ private:
     QString buildTextExport() const;
     QString buildJsonExport() const;
     static bool    isWindowsDarkMode();
-    QString        getCachedASN(const QString& ip, bool ipv6) const;
+    std::string    getCachedASN(const std::string& ip, bool ipv6) const;
     void           updateToolbarResponsiveLayout();
     bool           alignTargetEditToLossBar();
     void           scheduleButtonAlignment(int attemptsLeft = 30);

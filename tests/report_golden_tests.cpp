@@ -23,11 +23,8 @@
 
 #include "report_core.h"
 
-#include <QtCore/QDate>
-#include <QtCore/QDateTime>
-#include <QtCore/QRegularExpression>
-#include <QtCore/QTime>
-
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,10 +38,10 @@
 namespace {
 
 // Fixed clock: the test runs in UTC (main() sets TZ before anything reads
-// the time zone), the trace "started" at kStarted, the report was
-// "generated" at kGenerated. Until the builders take the generation time as
-// a parameter it is the real current time, normalized to kGenerated below.
-const char* const kGenerated = "2026-11-20T12:35:10";
+// the time zone); the trace "started" at 2026-11-20 12:34:56 and the report
+// was "generated" 14 s later.
+const ReportClock::time_point kStarted   = ReportClock::from_time_t(1795178096);   // 2026-11-20T12:34:56Z
+const ReportClock::time_point kGenerated = kStarted + std::chrono::seconds(14);
 
 SOCKADDR_INET v4(const char* text)
 {
@@ -132,7 +129,7 @@ std::vector<OpenMTRHostInfo> snapshotV6()
     return s;
 }
 
-QString asnFor(const QString& ip, bool /*ipv6*/)
+std::string asnFor(const std::string& ip, bool /*ipv6*/)
 {
     static const std::map<std::string, std::string> table = {
         { "192.0.2.1",     "64496" },
@@ -142,32 +139,25 @@ QString asnFor(const QString& ip, bool /*ipv6*/)
         { "2001:db8::1",   "64500" },
         { "2001:db8:2::1", "64501" },
     };
-    const auto it = table.find(ip.toStdString());
-    return it == table.end() ? QStringLiteral("-") : QString::fromStdString(it->second);
+    const auto it = table.find(ip);
+    return it == table.end() ? std::string("-") : it->second;
 }
 
 struct Scenario {
     std::string                  name;      // golden file stem
     std::string                  target;
     bool                         v6;
-    qint64                       durationMs;
+    int64_t                      durationMs;
     std::vector<OpenMTRHostInfo> state;
 };
 
 std::map<std::string, std::string> render(const Scenario& sc)
 {
-    const QDateTime started(QDate(2026, 11, 20), QTime(12, 34, 56));
-    const QString   target = QString::fromStdString(sc.target);
-    const auto      rows   = computeReportRows(sc.state, asnFor);
-
-    QString json = buildJsonReport(target, started, sc.durationMs, rows, sc.state);
-    json.replace(QRegularExpression(QStringLiteral("\"generated\": \"[^\"]*\"")),
-                 QStringLiteral("\"generated\": \"%1\"").arg(QLatin1String(kGenerated)));
-
+    const auto rows = computeReportRows(sc.state, asnFor);
     std::map<std::string, std::string> out;
-    out[sc.name + ".txt"]  = buildTextReport(target, started, sc.durationMs, rows, sc.state, sc.v6).toStdString();
-    out[sc.name + ".json"] = json.toStdString();
-    out[sc.name + ".csv"]  = buildCsvReport(rows).toStdString();
+    out[sc.name + ".txt"]  = buildTextReport(sc.target, kStarted, sc.durationMs, rows, sc.state, sc.v6);
+    out[sc.name + ".json"] = buildJsonReport(sc.target, kStarted, sc.durationMs, rows, sc.state, kGenerated);
+    out[sc.name + ".csv"]  = buildCsvReport(rows);
     return out;
 }
 

@@ -270,7 +270,28 @@ For a local build you need **CMake 3.25+**, **Ninja**, a **C++20 compiler** and 
 | **macOS** | Qt 6 from Qt's official installer. Homebrew's `qt` also builds, but it is compiled for whichever macOS release the machine runs, so a bundle made with it will not start on older systems, and it links ICU, which adds ~35 MB to the app. |
 | **Linux** | The distribution's `qt6-base-dev` is enough to build and run, provided it is Qt 6.12 or newer; otherwise build Qt from source. CI instead compiles Qt from source with `-no-icu`, purely to keep ICU out of the AppImage. |
 
+The JSON report is written with [jansson](https://github.com/akheron/jansson). CMake uses an installed copy if it finds one (`libjansson-dev`, `jansson-devel`, `brew install jansson`, vcpkg), otherwise it downloads the pinned release and links it statically; `-DOPENMTR_JANSSON=system` or `=bundled` forces one (release builds use `bundled`).
+
 The workflow in [`.github/workflows/build.yml`](.github/workflows/build.yml) documents the exact steps used in CI.
+
+### Without the window (report mode only, no Qt)
+
+For systems without Qt 6 — OpenWrt routers, minimal Linux installs, a
+distribution's command-line package — `-DOPENMTR_BUILD_GUI=OFF` builds the
+same `OpenMTR` without its window. It runs what `OpenMTR --report` runs, from
+the same sources, so reports, options and exit codes are identical; `--report`
+is accepted there but not needed. It needs only a C++20 compiler, CMake,
+jansson and the C library:
+
+```sh
+cmake -S . -B build -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_JANSSON=system
+cmake --build build
+cmake --install build          # bin/OpenMTR; a package may install it as "openmtr"
+```
+
+On Linux it needs ICMP ping sockets for its user (see the
+`net.ipv4.ping_group_range` note under [Requirements](#requirements)), or
+root, where it uses a raw ICMP socket instead.
 
 ---
 

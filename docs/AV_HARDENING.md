@@ -56,6 +56,16 @@ Rules that follow from this, if you ever touch `updatecheck.cpp`:
   the one CMake line to re-enable everywhere at once; there is deliberately
   no way for it to be on in one front end and off in the other.
 
+## Third-party code linked in: jansson
+
+The JSON report uses jansson. Release builds pass `-DOPENMTR_JANSSON=bundled`
+(`cmake/OpenMTRJansson.cmake`): a pinned release, checked against its
+SHA-256 and linked **statically** — no new DLL, no new import — with the
+app's CRT (`/MT`) and `/guard:cf`, and with `USE_WINDOWS_CRYPTOAPI=OFF`,
+which leaves out jansson's default `GetProcAddress("CryptGenRandom")` hash
+seeding (a dynamic API lookup, the kind of thing ML classifiers weight);
+the time/pid fallback seed is plenty for a JSON report's few keys.
+
 ## Windows PE hardening flags (`CMakeLists.txt` ~L340-390)
 
 - **`/guard:cf` + `/GUARD:CF`** (Control Flow Guard): standard exploit

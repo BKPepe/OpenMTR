@@ -18,6 +18,11 @@ main.cpp
  └─ otherwise                          → normal GUI: QApplication + MainWindow + exec()
 ```
 
+Built with `-DOPENMTR_BUILD_GUI=OFF` (`OPENMTR_GUI` 0 in main.cpp) the same
+`OpenMTR` target is compiled without Qt and without the window: every command
+line goes to `cli::run()`, `--report` or not. Still one program, one target —
+never two binaries.
+
 Everything that isn't UI chrome or CLI plumbing is **shared** between the two
 front ends, on purpose, so they can never disagree about what a trace found
 or how a report is formatted:
@@ -25,18 +30,24 @@ or how a report is formatted:
 | Shared module | Owns | Used by |
 |---|---|---|
 | `tracer.{h,cpp}` | The actual ICMP engine — `OpenMTRNet` (dispatch loop, per-hop state) and `OpenMTRNetWrapper` (threaded facade) | MainWindow (via wrapper) and cli.cpp (via wrapper) identically |
-| `report_core.{h,cpp}` | Turning an engine snapshot into display-ready rows; text/JSON/CSV formatting; warm-up/settling state machine (`warmupRouteSettled`, `dnsAndAsnSettled`) | MainWindow's table + Copy/Export; cli.cpp's `--report` output |
+| `report_core.{h,cpp}` | Turning an engine snapshot into display-ready rows; text/JSON/CSV formatting (JSON through jansson); warm-up/settling state machine (`warmupRouteSettled`, `dnsAndAsnSettled`). Qt-free, UTF-8 `std::string` throughout | MainWindow's table + Copy/Export; cli.cpp's `--report` output |
+| `textutil.{h,cpp}` | The few text operations the reports need, behaving exactly like the QString calls they replaced (UTF-16 widths, padding, `toInt`, UTF-8 repair) — `tests/golden/` holds the reports byte for byte | report_core |
 | `asn_resolver.{h,cpp}` | ASN lookup (Team Cymru DNS-TXT) through the system resolver: `res_query` + `ns_initparse`/`ns_parserr` from the C library (`res_n*` on macOS), `DnsQuery_W` on Windows — no external program | asncache.cpp |
 | `asncache.{h,cpp}` | Background ASN lookups (a thread per lookup, pending for at most 2 s) and their thread-safe cache, no Qt event loop required | MainWindow's table; cli.cpp |
 | `updatecheck.{h,cpp}` | GitHub release check via a `curl` subprocess, gated by one compile-time switch | MainWindow's About/badge; cli.cpp's startup notice |
-| `versioninfo.{h,cpp}` | The one-line version string (`"1.4.0 DEV (AMD64) · Qt 6.8.1"`) | MainWindow's About dialog; `--version` |
+| `versioninfo.{h,cpp}` | The one-line version string (`"1.4.0 (AMD64)"`; the window app appends `" · Qt 6.12.0"`) | MainWindow's About dialog; `--version` |
+
+The shared modules and `cli.{h,cpp}` use no Qt at all — standard C++20, the C
+library, jansson for JSON — and `cmake/OpenMTRCore.cmake` compiles them into
+the window app's target (`openmtr_add_core()`), so the app's warning,
+hardening and optimization flags cover them as before.
 
 Front-end-only code:
 
 | File | Owns |
 |---|---|
 | `MainWindow.{h,cpp}` | Everything visual: frameless window chrome, theming, the results table, dialogs. See `docs/GUI_INTERNALS.md`. |
-| `cli.{h,cpp}` | Argument parsing, the blocking warm-up/counting loop, progress line, `--output`, console-vs-redirected output handling on Windows (`writeText`). See its own file-header comment in `cli.cpp` for the exit-code table. |
+| `cli.{h,cpp}` | Argument parsing, the blocking warm-up/counting loop, progress line, `--output`, console-vs-redirected output handling on Windows (`writeText`), UTF-8 command line on Windows. Qt-free like the shared modules. See its own file-header comment in `cli.cpp` for the exit-code table. |
 | `main.cpp` | Entry point dispatch (above), Winsock init/teardown, per-platform `QApplication` setup (DPI rounding, AppImage desktop-entry self-registration, GTK theme override). |
 
 ## Data flow for one trace

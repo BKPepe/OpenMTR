@@ -179,6 +179,24 @@ static void endMacOsTraceActivity(void*& activity)
 //  File-local constants & helpers
 // ==========================================================================
 
+// The report's column headers (report_core.h's kColumns) as Qt strings, for
+// the table's header row.
+static const QStringList COLUMNS = [] {
+    QStringList list;
+    for (std::string_view name : kColumns)
+        list << QString::fromUtf8(name.data(), static_cast<qsizetype>(name.size()));
+    return list;
+}();
+
+// A test's start time (invalid when no test was counted) as report_core
+// takes it.
+static std::optional<ReportClock::time_point> reportTime(const QDateTime& t)
+{
+    if (!t.isValid())
+        return std::nullopt;
+    return ReportClock::time_point(std::chrono::milliseconds(t.toMSecsSinceEpoch()));
+}
+
 // Logical column order of the results table (Column enum, COLUMNS header
 // strings) is defined in report_core.h, shared with the CLI report. Two
 // spacer columns are added on top of these in setupUi().
@@ -1326,7 +1344,7 @@ void MainWindow::showAboutDialog()
     const QString msg = QString("Version %1\n\n"
             "Continuously traces the route to a host and shows per-hop latency and packet loss statistics in real time.\n\n"
             "© slamb.eu · GPL-2.0 license")
-        .arg(openMtrVersionLine());
+        .arg(QString::fromStdString(openMtrVersionLine()));
 
     MicaDialog::show(this,
         "OpenMTR",
@@ -2655,9 +2673,9 @@ void MainWindow::hideIconTooltip()
 // asncache.h/.cpp (shared by the GUI and the CLI report mode). m_asnCache is
 // an AsnCache — see there for how the thread-safe caching/pending
 // bookkeeping works.
-QString MainWindow::getCachedASN(const QString& ip, bool ipv6) const
+std::string MainWindow::getCachedASN(const std::string& ip, bool ipv6) const
 {
-    return QString::fromStdString(m_asnCache.get(ip.toStdString(), ipv6));
+    return m_asnCache.get(ip, ipv6);
 }
 
 // ==========================================================================
@@ -2689,7 +2707,7 @@ void MainWindow::onStartStop()
             // so push the frozen value to the title bar now — otherwise it
             // could lag up to a second behind the Duration in the reports.
             if (m_counting)
-                updateTitleSubtitle(formatDuration(m_testDurationMs));
+                updateTitleSubtitle(QString::fromStdString(formatDuration(m_testDurationMs)));
         }
         m_tracing  = false;
         m_counting = false;
@@ -2709,7 +2727,7 @@ void MainWindow::onStartStop()
             // see the comment above buildTextExport()/buildJsonExport() for
             // why this must happen before the cache is cleared below.
             m_finalRows = computeReportRows(m_finalState,
-                [this](const QString& ip, bool v6) { return getCachedASN(ip, v6); });
+                [this](const std::string& ip, bool v6) { return getCachedASN(ip, v6); });
         }
         m_asnCache.clear();
         if (m_stack->currentIndex() == 1)
@@ -2872,7 +2890,7 @@ void MainWindow::onElapsedTimer()
     // Remember exactly what is shown, so a Copy/Export made while the test
     // runs reports the same duration as the title bar instead of a fresher one.
     m_shownDurationMs = m_elapsed.elapsed();
-    updateTitleSubtitle(formatDuration(m_shownDurationMs));
+    updateTitleSubtitle(QString::fromStdString(formatDuration(m_shownDurationMs)));
 }
 
 // Warm-up state machine. Waits until the discovered route holds steady and
@@ -2892,7 +2910,7 @@ void MainWindow::onWarmupEnd()
     // time the table is revealed.
     for (const auto& h : state)
         if (h.addr.Ipv4.sin_family != AF_UNSPEC)
-            getCachedASN(QString::fromStdString(addr_to_string(h.addr)),
+            getCachedASN(addr_to_string(h.addr),
                          h.addr.Ipv6.sin6_family == AF_INET6);
 
     const int gen = m_warmupGen;
@@ -2960,7 +2978,7 @@ void MainWindow::updateTable()
 {
     if (!m_net) return;
     auto state = m_net->getCurrentState();
-    auto rowData = computeReportRows(state, [this](const QString& ip, bool v6) { return getCachedASN(ip, v6); });
+    auto rowData = computeReportRows(state, [this](const std::string& ip, bool v6) { return getCachedASN(ip, v6); });
     int rows = static_cast<int>(rowData.size());
     m_table->setRowCount(rows);
 
@@ -2977,7 +2995,7 @@ void MainWindow::updateTable()
         constexpr auto C = Qt::AlignCenter | Qt::AlignVCenter;
 
         for (int c = 0; c < ColCount; ++c)
-            setCell(c, row.cells[c], C);
+            setCell(c, QString::fromStdString(row.cells[c]), C);
 
         // Rows showing an ICMP status instead of an address merge the
         // Hostname and IP cells so the text sits centred across both; the
@@ -3016,7 +3034,7 @@ void MainWindow::updateTable()
                 if (h.anomalyCount > 0) {
                     if (!tip.isEmpty()) tip += ", ";
                     tip += QString("%1\u00d7 unexpected ICMP status/error (last: %2)")
-                               .arg(h.anomalyCount).arg(describeStatus(h.anomalyLast, m_traceIsV6));
+                               .arg(h.anomalyCount).arg(QString::fromStdString(describeStatus(h.anomalyLast, m_traceIsV6)));
                 }
                 lossItem->setData(Qt::ToolTipRole, tip.isEmpty() ? QVariant() : QVariant(tip));
             }
@@ -3064,18 +3082,20 @@ QString MainWindow::buildJsonExport() const
 {
     const auto state = m_net ? m_net->getCurrentState() : m_finalState;
     const auto rows   = m_net
-        ? computeReportRows(state, [this](const QString& ip, bool v6) { return getCachedASN(ip, v6); })
+        ? computeReportRows(state, [this](const std::string& ip, bool v6) { return getCachedASN(ip, v6); })
         : m_finalRows;
-    return buildJsonReport(m_reportTarget, m_testStartTime, currentTestDurationMs(), rows, state);
+    return QString::fromStdString(buildJsonReport(m_reportTarget.toStdString(), reportTime(m_testStartTime),
+                                                  currentTestDurationMs(), rows, state));
 }
 
 QString MainWindow::buildTextExport() const
 {
     const auto state = m_net ? m_net->getCurrentState() : m_finalState;
     const auto rows   = m_net
-        ? computeReportRows(state, [this](const QString& ip, bool v6) { return getCachedASN(ip, v6); })
+        ? computeReportRows(state, [this](const std::string& ip, bool v6) { return getCachedASN(ip, v6); })
         : m_finalRows;
-    return buildTextReport(m_reportTarget, m_testStartTime, currentTestDurationMs(), rows, state, m_traceIsV6);
+    return QString::fromStdString(buildTextReport(m_reportTarget.toStdString(), reportTime(m_testStartTime),
+                                                  currentTestDurationMs(), rows, state, m_traceIsV6));
 }
 
 // Copy the full text report to the clipboard.
@@ -3509,9 +3529,9 @@ void MainWindow::onExport()
     } else if (path.endsWith(".csv", Qt::CaseInsensitive)) {
         const auto state = m_net ? m_net->getCurrentState() : m_finalState;
         const auto rows   = m_net
-            ? computeReportRows(state, [this](const QString& ip, bool v6) { return getCachedASN(ip, v6); })
+            ? computeReportRows(state, [this](const std::string& ip, bool v6) { return getCachedASN(ip, v6); })
             : m_finalRows;
-        ts << buildCsvReport(rows);
+        ts << QString::fromStdString(buildCsvReport(rows));
     } else {
         ts << buildTextExport();
     }

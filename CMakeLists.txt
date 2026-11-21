@@ -25,18 +25,21 @@ if(APPLE AND (NOT DEFINED OPENMTR_BUILD_GUI OR OPENMTR_BUILD_GUI))
     set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "Build architectures" FORCE)
 endif()
 
-project(OpenMTR VERSION 1.4.0 LANGUAGES CXX)
+# C as well: the bundled jansson (cmake/OpenMTRJansson.cmake) is a C library.
+project(OpenMTR VERSION 1.4.0 LANGUAGES C CXX)
 
 # ---- Language ----------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---- Build options -----------------------------------------------------------
-# The window app is the default and only shipped artifact. OFF builds without
-# Qt at all: what remains is the Qt-free core (the engine in tracer.cpp) and
-# the tests for it, which is how CI tests the core on Linux (glibc and musl)
-# without building Qt there.
-option(OPENMTR_BUILD_GUI   "Build the Qt Widgets application (OpenMTR)" ON)
+# The window app is the default and only shipped artifact. OFF builds the
+# same OpenMTR without its window and without Qt at all — report mode only:
+# exactly what `OpenMTR --report` does, from the same sources, for systems
+# without Qt 6 (OpenWrt, minimal Linux installs, distribution packages). It
+# is still one program, one target: never both from one configure. CI uses
+# it to test the Qt-free core on Linux (glibc and musl) without building Qt.
+option(OPENMTR_BUILD_GUI   "Build the window app (Qt); OFF: report mode only, no Qt" ON)
 # Off by default, so a normal build is unchanged. CI turns it on in build
 # directories of their own (see .github/workflows/build.yml).
 option(OPENMTR_BUILD_TESTS "Build the tests in tests/"                  OFF)
@@ -65,36 +68,12 @@ if(WIN32)
 endif()
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
-# ---- System resolver (ASN lookups, src/asn_resolver.cpp) ---------------------
-# res_query() and ns_initparse()/ns_parserr() are in the C library itself on
-# musl (OpenWrt), but in libresolv on glibc and macOS (where the ns_* names
-# are macros for libresolv's res_9_* symbols, hence a link test rather than
-# a symbol check). Windows uses DnsQuery_W (dnsapi) instead.
-set(OPENMTR_RESOLV_LIBS "")
-if(NOT WIN32)
-    include(CheckCXXSourceCompiles)
-    set(_openmtr_ns_test [=[
-        #include <sys/types.h>
-        #include <netinet/in.h>
-        #include <arpa/nameser.h>
-        #include <resolv.h>
-        int main() {
-            unsigned char answer[512];
-            ns_msg msg;
-            int n = res_query("example.", ns_c_in, ns_t_txt, answer, sizeof(answer));
-            return ns_initparse(answer, n, &msg);
-        }]=])
-    check_cxx_source_compiles("${_openmtr_ns_test}" OPENMTR_RESOLV_IN_LIBC)
-    if(NOT OPENMTR_RESOLV_IN_LIBC)
-        set(CMAKE_REQUIRED_LIBRARIES resolv)
-        check_cxx_source_compiles("${_openmtr_ns_test}" OPENMTR_RESOLV_IN_LIBRESOLV)
-        unset(CMAKE_REQUIRED_LIBRARIES)
-        if(NOT OPENMTR_RESOLV_IN_LIBRESOLV)
-            message(FATAL_ERROR "res_query()/ns_initparse() found neither in the C library nor in libresolv")
-        endif()
-        set(OPENMTR_RESOLV_LIBS resolv)
-    endif()
-endif()
+# ---- JSON library (the JSON report, src/report_core.cpp) ----------------------
+include(cmake/OpenMTRJansson.cmake)
+
+# ---- The Qt-free core (engine, reports, ASN, report-mode command line) ------
+# openmtr_add_core(<target>) compiles it into a front end; see the file.
+include(cmake/OpenMTRCore.cmake)
 
 # ---- Tests -------------------------------------------------------------------
 if(OPENMTR_BUILD_TESTS)
@@ -103,11 +82,30 @@ if(OPENMTR_BUILD_TESTS)
 endif()
 
 # ============================================================================
-#  The window app (OPENMTR_BUILD_GUI) — everything below needs Qt
+#  Without the window (-DOPENMTR_BUILD_GUI=OFF): OpenMTR in report mode only
 # ============================================================================
+# main.cpp with OPENMTR_GUI 0 runs cli::run() for every command line, so
+# `OpenMTR --report ...` scripts work unchanged and `--report` is optional.
+# No Qt, no desktop file, no icon: a single executable for bin/.
 if(NOT OPENMTR_BUILD_GUI)
+    add_executable(OpenMTR src/main.cpp)
+    openmtr_add_core(OpenMTR)
+    target_compile_definitions(OpenMTR PRIVATE OPENMTR_GUI=0)
+    if(MSVC)
+        target_compile_options(OpenMTR PRIVATE /W4 /WX /wd4100 /wd4127 /guard:cf)
+        target_link_options(OpenMTR PRIVATE /GUARD:CF)
+    else()
+        # No -O or -g here: packagers (and CMAKE_BUILD_TYPE) set those.
+        target_compile_options(OpenMTR PRIVATE -Wall -Wextra)
+    endif()
+    include(GNUInstallDirs)
+    install(TARGETS OpenMTR RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
     return()
 endif()
+
+# ============================================================================
+#  The window app (OPENMTR_BUILD_GUI) — everything below needs Qt
+# ============================================================================
 
 # Qt code generation (moc for Q_OBJECT classes, rcc for resources.qrc).
 set(CMAKE_AUTOMOC ON)
@@ -150,22 +148,18 @@ qt_add_executable(OpenMTR
     src/main.cpp
     src/MainWindow.cpp
     src/MainWindow.h
-    src/tracer.cpp
-    src/tracer.h
-    src/report_core.cpp
-    src/report_core.h
-    src/asncache.cpp
-    src/asncache.h
-    src/asn_resolver.cpp
-    src/asn_resolver.h
     src/updatecheck.cpp
     src/updatecheck.h
-    src/versioninfo.cpp
-    src/versioninfo.h
-    src/cli.cpp
-    src/cli.h
     resources/resources.qrc
 )
+# Engine, reports, ASN lookups and the --report command line: the Qt-free
+# core (cmake/OpenMTRCore.cmake), compiled into this target so every option
+# below applies to it too.
+openmtr_add_core(OpenMTR)
+
+# The version line the core prints ("1.4.0 (AMD64)") gets the Qt version
+# appended in this build — the About dialog's and --version's text.
+target_compile_definitions(OpenMTR PRIVATE OPENMTR_GUI=1 OPENMTR_QT_VERSION="${Qt6_VERSION}")
 
 # Update-check kill switch. At 0, checkForUpdateBlocking() (both its call
 # sites, in MainWindow.cpp and cli.cpp, and its body in updatecheck.cpp)
@@ -216,7 +210,6 @@ target_link_libraries(OpenMTR PRIVATE
 if(UNIX AND NOT APPLE)
     target_link_libraries(OpenMTR PRIVATE Qt6::DBus PkgConfig::XCB_SHAPE)
 endif()
-target_link_libraries(OpenMTR PRIVATE ${OPENMTR_RESOLV_LIBS})
 
 if(WIN32)
     target_link_libraries(OpenMTR PRIVATE

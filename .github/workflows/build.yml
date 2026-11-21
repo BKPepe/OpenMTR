@@ -181,6 +181,7 @@ jobs:
           cmake -S . -B build -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DCMAKE_PREFIX_PATH=${{ matrix.prefix }} ^
+            -DOPENMTR_JANSSON=bundled ^
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded && ^
           cmake --build build --parallel
 
@@ -319,7 +320,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$HOME/qt-macos-static"
+            -DCMAKE_PREFIX_PATH="$HOME/qt-macos-static" \
+            -DOPENMTR_JANSSON=bundled
           cmake --build build --parallel
 
       - name: Engine and report tests
@@ -329,13 +331,13 @@ jobs:
         # hangs. report_golden_tests compares the text/JSON/CSV reports with
         # tests/golden/ byte for byte. A build directory of its own and no
         # window (-DOPENMTR_BUILD_GUI=OFF), so the app above is untouched and
-        # every test target is built without naming them one by one; the
-        # golden test still finds the Qt it needs through the prefix path.
+        # every test target is built without naming them one by one.
         run: |
           cmake -S . -B build-tests -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$HOME/qt-macos-static" \
             -DOPENMTR_BUILD_GUI=OFF \
+            -DOPENMTR_JANSSON=bundled \
             -DOPENMTR_BUILD_TESTS=ON
           cmake --build build-tests --parallel
           ctest --test-dir build-tests --output-on-failure --no-tests=error
@@ -583,6 +585,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$HOME/qt-noicu" \
+            -DOPENMTR_JANSSON=bundled \
             -DCMAKE_INSTALL_PREFIX=/usr
           cmake --build build --parallel
 
@@ -731,7 +734,9 @@ jobs:
   #     where no one may open a ping socket, so refused_socket runs instead
   #     of skipping;
   #   - the same as root, where the engine falls back to a raw socket;
-  #   - across a three-hop network of namespaces (tests/netns/topo.sh);
+  #   - across a three-hop network of namespaces (tests/netns/topo.sh),
+  #     the engine alone and then the OpenMTR this job builds without Qt
+  #     (report mode only), end to end with a DNS server for the lookups;
   #   - in an Alpine container: musl libc, as on OpenWrt.
   core-linux:
     runs-on: ubuntu-26.04
@@ -744,12 +749,13 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build \
+            pkg-config libjansson-dev
 
       - name: Build (glibc)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_BUILD_TESTS=ON
+            -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_BUILD_TESTS=ON -DOPENMTR_JANSSON=system
           cmake --build build --parallel
 
       - name: Tests (glibc, unprivileged)
@@ -778,15 +784,81 @@ jobs:
         # socket (root, ping sockets refused) and through a ping socket.
         run: sudo tests/netns/engine_topology.sh build/tests/engine_tests
 
+      - name: Report mode end to end (the OpenMTR built without Qt)
+        # The same network with a DNS server for the reverse and ASN
+        # lookups: every format, --output, each exit code, Ctrl+C, root and
+        # an unprivileged user. Nothing is uploaded: the binary only exists
+        # to be tested here.
+        run: |
+          build/OpenMTR --version
+          sudo tests/netns/cli_matrix.sh build/OpenMTR
+
       - name: Build and tests (musl, Alpine)
         run: |
           docker run --rm -v "$PWD:/src:ro" alpine:3.22 sh -ec '
-            apk add --no-cache build-base cmake samurai linux-headers
+            apk add --no-cache build-base cmake samurai linux-headers pkgconf jansson-dev
             cmake -S /src -B /tmp/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_BUILD_TESTS=ON
+              -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_BUILD_TESTS=ON -DOPENMTR_JANSSON=system
             cmake --build /tmp/build --parallel
             ctest --test-dir /tmp/build --output-on-failure --no-tests=error
+            /tmp/build/OpenMTR --version
           '
+
+  # ==========================================================================
+  #  Windows core tests: the Qt-free core under MSVC
+  # ==========================================================================
+  # The Windows app jobs build the core into OpenMTR.exe (/W4 /WX), but run
+  # nothing of it. This one builds without the window — no Qt to build, so
+  # it is quick — runs every test that is not POSIX-only (reports
+  # byte for byte, the text helpers, ICMP parsers, ASN parsing and cache, the
+  # command line) and a loopback trace through IcmpSendEcho2 with the
+  # report-mode OpenMTR.exe. Nothing is uploaded.
+  core-windows:
+    runs-on: windows-latest
+    name: Core tests (Windows AMD64)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Setup MSVC
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: amd64
+          toolset: ${{ env.MSVC_TOOLSET }}
+
+      - name: Ensure Ninja
+        shell: pwsh
+        run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y }
+
+      - name: Build
+        shell: cmd
+        run: |
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded ^
+            -DOPENMTR_BUILD_GUI=OFF ^
+            -DOPENMTR_BUILD_TESTS=ON ^
+            -DOPENMTR_JANSSON=bundled && ^
+          cmake --build build --parallel
+
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Report mode end to end (loopback)
+        shell: pwsh
+        run: |
+          .\build\OpenMTR.exe --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\build\OpenMTR.exe --time 0 127.0.0.1
+          if ($LASTEXITCODE -ne 2) { Write-Error "--time 0: exit $LASTEXITCODE, expected 2"; exit 1 }
+          $json = .\build\OpenMTR.exe --time 2 --json 127.0.0.1
+          if ($LASTEXITCODE -ne 0) { Write-Error "loopback trace: exit $LASTEXITCODE, expected 0"; exit 1 }
+          $report = ($json -join "`n") | ConvertFrom-Json
+          if ($report.hops[0].ip -ne "127.0.0.1" -or $report.hops[0].recv -lt 1) {
+            Write-Error "unexpected first hop: $($report.hops[0] | ConvertTo-Json -Compress)"; exit 1
+          }
+          $report.hops[0] | ConvertTo-Json -Compress
 
   # ==========================================================================
   #  Sanitizers and fuzzing: the Qt-free core under ASan + UBSan
@@ -814,11 +886,16 @@ jobs:
         run: |
           CC=clang CXX=clang++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
             -DOPENMTR_BUILD_GUI=OFF -DOPENMTR_BUILD_TESTS=ON -DOPENMTR_BUILD_FUZZERS=ON \
+            -DOPENMTR_JANSSON=bundled \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
           cmake --build build --parallel
 
       - name: Tests under the sanitizers
         run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      - name: Report mode end to end under the sanitizers
+        run: sudo tests/netns/cli_matrix.sh build/OpenMTR
 
       - name: Fuzz the ICMP parsers for 60 s
         run: build/tests/fuzz_icmp -max_total_time=60 -print_final_stats=1

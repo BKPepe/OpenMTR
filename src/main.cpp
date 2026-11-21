@@ -4,14 +4,24 @@
 //  On Windows, brings up Winsock before anything else (the tracer needs it)
 //  and tears it down on exit. Creates the Qt application object and the main
 //  window, then runs the event loop.
+//
+//  Also the entry point of a build without the window (-DOPENMTR_BUILD_GUI
+//  =OFF, OPENMTR_GUI 0 here): the same OpenMTR in report mode only, with no
+//  Qt at all — every command line goes to cli::run(), `--report` or not.
 // ==========================================================================
+
+#ifndef OPENMTR_GUI
+#define OPENMTR_GUI 1
+#endif
 
 // ==========================================================================
 //  Includes
 // ==========================================================================
 
 // Project headers.
+#if OPENMTR_GUI
 #include "MainWindow.h"
+#endif
 #include "cli.h"
 #include "version.h"
 
@@ -23,8 +33,10 @@
 #endif
 
 // Qt.
+#if OPENMTR_GUI
 #include <QtWidgets/QApplication>
 #include <QtPlugin>
+#endif
 
 #ifdef Q_OS_LINUX
 #include <QtCore/QDir>
@@ -42,7 +54,7 @@
 // the only platform built as a fully static Qt binary. macOS links Qt
 // dynamically and bundles the Cocoa platform plugin via macdeployqt instead
 // (see .github/workflows/build.yml).
-#ifdef _WIN32
+#if OPENMTR_GUI && defined(_WIN32)
 Q_IMPORT_PLUGIN(QWindowsIntegrationPlugin)
 #endif
 
@@ -151,6 +163,12 @@ int main(int argc, char* argv[])
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
 
+#if !OPENMTR_GUI
+    // Built without the window: every command line is a report-mode one,
+    // `--report` or not (the parser accepts and ignores it), so scripts
+    // written for the window app's `OpenMTR --report ...` run unchanged.
+    const int ret = cli::run(argc, argv);
+#else
     // Headless report mode: `OpenMTR --report --time <sec> ... <target>`
     // skips the GUI entirely — no QApplication, no window, no event loop —
     // so it also works over SSH, from cron, or in CI with no display at
@@ -217,6 +235,7 @@ int main(int argc, char* argv[])
     MainWindow w;
     w.show();
     int ret = app.exec();
+#endif // OPENMTR_GUI
 
 #ifdef _WIN32
     WSACleanup();

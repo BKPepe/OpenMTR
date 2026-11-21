@@ -1,38 +1,40 @@
 #include "report_core.h"
+#include "textutil.h"
 
-#include <QtCore/QJsonArray>
-#include <QtCore/QJsonDocument>
-#include <QtCore/QJsonObject>
-#include <QtCore/QJsonValue>
+#include <jansson.h>
 
-// ==========================================================================
-//  Columns
-// ==========================================================================
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
 
-const QStringList COLUMNS = {
-    "Hop", "ASN", "Hostname", "IP", "Loss %", "Sent", "Recv",
-    "Best ms", "Avrg ms", "Wrst ms", "Last ms", "Jttr ms"
-};
+using textutil::leftJustified;
+using textutil::rightJustified;
+using textutil::utf16Length;
 
 // ==========================================================================
 //  Status text / duration formatting
 // ==========================================================================
 
-QString describeStatus(unsigned long status, bool ipv6)
+std::string describeStatus(unsigned long status, bool ipv6)
 {
-    QString text = QString::fromLatin1(OpenMTRStatusText(status, ipv6));
-    if (text.endsWith(QLatin1Char('.')))
-        text.chop(1);
-    return QStringLiteral("%1, code %2").arg(text).arg(status);
+    std::string text = OpenMTRStatusText(status, ipv6);
+    if (!text.empty() && text.back() == '.')
+        text.pop_back();
+    return text + ", code " + std::to_string(status);
 }
 
-QString formatDuration(qint64 ms)
+std::string formatDuration(int64_t ms)
 {
-    qint64 secs = ms / 1000;
-    int h = static_cast<int>(secs / 3600), m = static_cast<int>((secs % 3600) / 60), s = static_cast<int>(secs % 60);
-    return h > 0
-        ? QString("%1:%2:%3").arg(h).arg(m, 2, 10, QChar('0')).arg(s, 2, 10, QChar('0'))
-        : QString("%1:%2").arg(m).arg(s, 2, 10, QChar('0'));
+    const int64_t secs = ms / 1000;
+    const int h = static_cast<int>(secs / 3600), m = static_cast<int>((secs % 3600) / 60),
+              s = static_cast<int>(secs % 60);
+    char buf[32];
+    if (h > 0)
+        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s);
+    else
+        std::snprintf(buf, sizeof(buf), "%d:%02d", m, s);
+    return buf;
 }
 
 // ==========================================================================
@@ -40,7 +42,7 @@ QString formatDuration(qint64 ms)
 // ==========================================================================
 
 std::vector<ReportRow> computeReportRows(const std::vector<OpenMTRHostInfo>& state,
-                                          const AsnLookupFn& asnLookup)
+                                         const AsnLookupFn& asnLookup)
 {
     std::vector<ReportRow> rows;
     rows.reserve(state.size());
@@ -49,95 +51,145 @@ std::vector<ReportRow> computeReportRows(const std::vector<OpenMTRHostInfo>& sta
         const auto& h = state[i];
         ReportRow row;
 
-        QString ip   = QString::fromStdString(addr_to_string(h.addr));
-        bool hasAddr = (h.addr.Ipv4.sin_family != AF_UNSPEC);
-        // fromStdString: UTF-8, with any invalid bytes of a raw resolver
-        // answer replaced by U+FFFD.
-        QString name = QString::fromStdString(h.getName());
-        if (hasAddr && name.isEmpty()) name = ip;
+        const std::string ip = addr_to_string(h.addr);
+        const bool hasAddr   = (h.addr.Ipv4.sin_family != AF_UNSPEC);
+        // A reverse-DNS answer is raw bytes on POSIX; repaired once, here,
+        // for the table and every report format (JSON needs valid UTF-8).
+        std::string name = textutil::toValidUtf8(h.getName());
+        if (hasAddr && name.empty()) name = ip;
         // Hops without an address show the engine's status text ("Request
         // timed out.", "Destination host unreachable.", ...) so active ICMP
         // refusals are visible instead of hiding behind a dash. Before the
         // first probe completes there is no status yet, hence the dash.
-        if (!hasAddr && name.isEmpty()) name = QStringLiteral("-");
+        if (!hasAddr && name.empty()) name = "-";
 
-        row.errorRow = !hasAddr && name != QLatin1String("-");
+        row.errorRow = !hasAddr && name != "-";
 
-        row.cells[ColHop]      = QString::number(static_cast<int>(i) + 1);
-        row.cells[ColAsn]      = hasAddr ? asnLookup(ip, h.addr.Ipv6.sin6_family == AF_INET6)
-                                          : QStringLiteral("-");
+        row.cells[ColHop]      = std::to_string(i + 1);
+        row.cells[ColAsn]      = hasAddr ? asnLookup(ip, h.addr.Ipv6.sin6_family == AF_INET6) : "-";
         row.cells[ColHostname] = name;
-        row.cells[ColIp]       = hasAddr ? ip : QStringLiteral("-");
+        row.cells[ColIp]       = hasAddr ? ip : "-";
 
         if (h.xmit == 0) {
-            for (int c = ColLoss; c < ColCount; ++c) row.cells[c] = QStringLiteral("-");
+            for (int c = ColLoss; c < ColCount; ++c) row.cells[c] = "-";
         } else {
-            int loss = 100 - (100 * h.returned / h.xmit);
-            row.cells[ColLoss] = QString::number(loss);
-            row.cells[ColSent] = QString::number(h.xmit);
-            row.cells[ColRecv] = QString::number(h.returned);
-            row.cells[ColBest] = h.returned == 0 ? QStringLiteral("-") : QString::number(h.best);
-            row.cells[ColAvrg] = h.returned == 0 ? QStringLiteral("-") : QString::number(h.getAvg());
-            row.cells[ColWrst] = h.returned == 0 ? QStringLiteral("-") : QString::number(h.worst);
-            row.cells[ColLast] = h.returned == 0 ? QStringLiteral("-") : QString::number(h.last);
-            row.cells[ColJttr] = h.returned < 2  ? QStringLiteral("-") : QString::number(h.getJitter());
+            const int loss = 100 - (100 * h.returned / h.xmit);
+            row.cells[ColLoss] = std::to_string(loss);
+            row.cells[ColSent] = std::to_string(h.xmit);
+            row.cells[ColRecv] = std::to_string(h.returned);
+            row.cells[ColBest] = h.returned == 0 ? "-" : std::to_string(h.best);
+            row.cells[ColAvrg] = h.returned == 0 ? "-" : std::to_string(h.getAvg());
+            row.cells[ColWrst] = h.returned == 0 ? "-" : std::to_string(h.worst);
+            row.cells[ColLast] = h.returned == 0 ? "-" : std::to_string(h.last);
+            row.cells[ColJttr] = h.returned < 2  ? "-" : std::to_string(h.getJitter());
         }
 
-        rows.push_back(row);
+        rows.push_back(std::move(row));
     }
     return rows;
 }
 
 // ==========================================================================
-//  Text / JSON export
+//  Text / JSON / CSV export
 // ==========================================================================
 
-QString buildJsonReport(const QString& target,
-                         const QDateTime& testStarted,
-                         qint64 durationMs,
-                         const std::vector<ReportRow>& rows,
-                         const std::vector<OpenMTRHostInfo>& state)
+namespace {
+
+std::time_t timeOf(std::optional<ReportClock::time_point> t)
 {
-    static const QStringList keys = {
+    return ReportClock::to_time_t(t.value_or(ReportClock::now()));
+}
+
+// jansson takes its strings as valid UTF-8 (and refuses anything else);
+// everything put into the report goes through here.
+json_t* jsonString(const std::string& s)
+{
+    const std::string valid = textutil::toValidUtf8(s);
+    return json_stringn(valid.data(), valid.size());
+}
+
+struct JsonDeleter {
+    void operator()(json_t* j) const { json_decref(j); }
+};
+
+}  // namespace
+
+std::string buildJsonReport(const std::string& target,
+                            std::optional<ReportClock::time_point> testStarted,
+                            int64_t durationMs,
+                            const std::vector<ReportRow>& rows,
+                            const std::vector<OpenMTRHostInfo>& state,
+                            std::optional<ReportClock::time_point> generated)
+{
+    static const char* const keys[ColCount] = {
         "hop", "asn", "hostname", "ip", "loss", "sent", "recv",
         "best", "avrg", "wrst", "last", "jttr"
     };
-    QJsonArray hops;
+    std::unique_ptr<json_t, JsonDeleter> root(json_object());
+    json_t* hops = json_array();
     for (size_t i = 0; i < rows.size(); ++i) {
         const ReportRow& row = rows[i];
-        QJsonObject o;
+        json_t* o = json_object();
         for (int c = 0; c < ColCount; ++c) {
-            const QString& v = row.cells[c];
-            if (v.isEmpty() || v == QLatin1String("-")) {
-                o[keys[c]] = QJsonValue::Null;
-                continue;
-            }
-            bool numeric = false;
-            const int n = v.toInt(&numeric);
-            o[keys[c]] = numeric ? QJsonValue(n) : QJsonValue(v);
+            const std::string& v = row.cells[c];
+            // Missing values are null; anything QString::toInt() would take
+            // for a number is one (the host name "1234" included, as ever).
+            int n = 0;
+            json_t* value = (v.empty() || v == "-") ? json_null()
+                          : textutil::parseInt(v, n) ? json_integer(n)
+                                                     : jsonString(v);
+            json_object_set_new(o, keys[c], value);
         }
         if (i < state.size() && state[i].altCount > 0) {
-            o["alt_ip"]    = QString::fromStdString(addr_to_string(state[i].altAddr));
-            o["alt_count"] = state[i].altCount;
+            json_object_set_new(o, "alt_ip",    jsonString(addr_to_string(state[i].altAddr)));
+            json_object_set_new(o, "alt_count", json_integer(state[i].altCount));
         }
-        hops.append(o);
+        json_array_append_new(hops, o);
     }
-    QJsonObject root;
-    root["target"]           = target;
-    root["test_started"]     = (testStarted.isValid() ? testStarted : QDateTime::currentDateTime()).toString(Qt::ISODate);
-    root["duration_seconds"] = static_cast<qint64>(durationMs / 1000);
-    root["generated"]        = QDateTime::currentDateTime().toString(Qt::ISODate);
-    root["hops"]             = hops;
-    return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    json_object_set_new(root.get(), "target",           jsonString(target));
+    json_object_set_new(root.get(), "test_started",
+                        jsonString(textutil::formatLocalTime(timeOf(testStarted), "%Y-%m-%dT%H:%M:%S")));
+    json_object_set_new(root.get(), "duration_seconds", json_integer(durationMs / 1000));
+    json_object_set_new(root.get(), "generated",
+                        jsonString(textutil::formatLocalTime(timeOf(generated), "%Y-%m-%dT%H:%M:%S")));
+    json_object_set_new(root.get(), "hops",             hops);
+
+    // Four-space indentation and sorted keys: the layout QJsonDocument's
+    // Indented format produced, so reports are byte-identical to the ones
+    // OpenMTR wrote before it used jansson (tests/golden/).
+    std::unique_ptr<char, decltype(&std::free)> text(
+        json_dumps(root.get(), JSON_INDENT(4) | JSON_SORT_KEYS), &std::free);
+    if (!text)
+        return std::string();
+    std::string out(text.get());
+    // jansson writes the hex digits of a \u escape (only control characters
+    // get one here) in upper case, QJsonDocument wrote them in lower case.
+    // Both are valid JSON; keep the old bytes. Backslashes only occur in
+    // escapes, so after one, the next character is always the escape's own.
+    for (size_t i = 0; i + 1 < out.size(); ++i) {
+        if (out[i] != '\\')
+            continue;
+        if (out[i + 1] == 'u')
+            for (size_t k = i + 2; k < i + 6 && k < out.size(); ++k)
+                if (out[k] >= 'A' && out[k] <= 'F')
+                    out[k] = static_cast<char>(out[k] - 'A' + 'a');
+        ++i;
+    }
+    out += '\n';
+    return out;
 }
 
-QString buildCsvReport(const std::vector<ReportRow>& rows)
+std::string buildCsvReport(const std::vector<ReportRow>& rows)
 {
-    QString out = COLUMNS.join(',') + "\n";
+    std::string out;
+    for (int c = 0; c < ColCount; ++c) {
+        if (c) out += ',';
+        out += kColumns[c];
+    }
+    out += '\n';
     for (const auto& row : rows) {
-        QStringList cells;
         for (int c = 0; c < ColCount; ++c) {
-            QString val = row.cells[c];
+            std::string val = row.cells[c];
             // Neutralise spreadsheet formula injection, but only in the
             // hostname column — the one place a remote party controls the
             // text: a hop along the path can name itself "=cmd|..." via
@@ -146,70 +198,72 @@ QString buildCsvReport(const std::vector<ReportRow>& rows)
             // the OWASP-recommended quote prefix. The other columns are
             // app-generated numbers, addresses and fixed strings, where
             // prefixing could only distort data.
-            if (c == ColHostname && !val.isEmpty() && val != QLatin1String("-")) {
-                const QChar c0 = val.at(0);
-                if (c0 == QLatin1Char('=') || c0 == QLatin1Char('+') ||
-                    c0 == QLatin1Char('-') || c0 == QLatin1Char('@') ||
-                    c0 == QLatin1Char('\t'))
-                    val.prepend(QLatin1Char('\''));
+            if (c == ColHostname && !val.empty() && val != "-") {
+                const char c0 = val[0];
+                if (c0 == '=' || c0 == '+' || c0 == '-' || c0 == '@' || c0 == '\t')
+                    val.insert(val.begin(), '\'');
             }
-            if (val.contains(',') || val.contains('"'))
-                val = "\"" + val.replace("\"", "\"\"") + "\"";
-            cells << val;
+            if (val.find_first_of(",\"") != std::string::npos) {
+                std::string quoted = "\"";
+                for (const char ch : val) {
+                    if (ch == '"') quoted += '"';
+                    quoted += ch;
+                }
+                val = quoted + "\"";
+            }
+            if (c) out += ',';
+            out += val;
         }
-        out += cells.join(',') + "\n";
+        out += '\n';
     }
     return out;
 }
 
-QString buildTextReport(const QString& target,
-                         const QDateTime& testStarted,
-                         qint64 durationMs,
-                         const std::vector<ReportRow>& rows,
-                         const std::vector<OpenMTRHostInfo>& state,
-                         bool traceIsV6)
+std::string buildTextReport(const std::string& target,
+                            std::optional<ReportClock::time_point> testStarted,
+                            int64_t durationMs,
+                            const std::vector<ReportRow>& rows,
+                            const std::vector<OpenMTRHostInfo>& state,
+                            bool traceIsV6)
 {
-    const int NCOLS = ColCount;
-    std::vector<int> W(NCOLS);
-    for (int c = 0; c < NCOLS; ++c) {
-        int w = static_cast<int>(COLUMNS[c].length());
-        for (const auto& row : rows) {
-            const int len = static_cast<int>(row.cells[c].length());
-            if (len > w) w = len;
-        }
+    // Column widths in UTF-16 code units, as they have always been measured
+    // (QString::length()): a host name with non-ASCII characters keeps
+    // today's alignment.
+    std::array<size_t, ColCount> W{};
+    for (int c = 0; c < ColCount; ++c) {
+        size_t w = utf16Length(kColumns[c]);
+        for (const auto& row : rows)
+            w = std::max(w, utf16Length(row.cells[c]));
         W[c] = w;
     }
-    auto pad = [](const QString& s, int w) { return s.leftJustified(w, ' '); };
     // Every column reads better right-aligned (numbers/percentages lining up
     // on their ones digit) except Hostname and IP, which are free-form text
     // of very different lengths — those stay left-aligned. Applies to the
     // header row too, so it lines up with the data underneath it.
-    auto padRight = [](const QString& s, int w) { return s.rightJustified(w, ' '); };
     auto isRightAligned = [](int c) { return c != ColHostname && c != ColIp; };
-    auto cell = [&](const QString& s, int c) {
-        return isRightAligned(c) ? padRight(s, W[c]) : pad(s, W[c]);
+    auto cell = [&](std::string_view s, int c) {
+        return isRightAligned(c) ? rightJustified(s, W[c]) : leftJustified(s, W[c]);
     };
-    QString sep = "+";
-    for (int c = 0; c < NCOLS; ++c) sep += QString(W[c] + 2, '-') + "+";
-    QString out;
+    std::string sep = "+";
+    for (int c = 0; c < ColCount; ++c) sep += std::string(W[c] + 2, '-') + "+";
+    std::string out;
     out += "OpenMTR Export\n";
-    out += QString("Target  : %1\n").arg(target);
-    out += QString("Date    : %1\n").arg((testStarted.isValid() ? testStarted : QDateTime::currentDateTime())
-                                              .toString("yyyy-MM-dd hh:mm:ss"));
-    out += QString("Duration: %1\n\n").arg(formatDuration(durationMs));
+    out += "Target  : " + textutil::toValidUtf8(target) + "\n";
+    out += "Date    : " + textutil::formatLocalTime(timeOf(testStarted), "%Y-%m-%d %H:%M:%S") + "\n";
+    out += "Duration: " + formatDuration(durationMs) + "\n\n";
     out += sep + "\n";
-    QString hdr = "|";
-    for (int c = 0; c < NCOLS; ++c) hdr += " " + cell(COLUMNS[c], c) + " |";
+    std::string hdr = "|";
+    for (int c = 0; c < ColCount; ++c) hdr += " " + cell(kColumns[c], c) + " |";
     out += hdr + "\n" + sep + "\n";
     for (const auto& row : rows) {
-        QString line = "|";
-        for (int c = 0; c < NCOLS; ++c) {
+        std::string line = "|";
+        for (int c = 0; c < ColCount; ++c) {
             if (row.errorRow && c == ColHostname) {
                 // Error rows merge Hostname+IP into one left-aligned field
                 // spanning the combined width of both columns — still text,
                 // so it stays left-aligned like Hostname/IP normally would.
-                const int wSpan = W[ColHostname] + W[ColIp] + 3;
-                line += " " + pad(row.cells[ColHostname], wSpan) + " |";
+                const size_t wSpan = W[ColHostname] + W[ColIp] + 3;
+                line += " " + leftJustified(row.cells[ColHostname], wSpan) + " |";
                 ++c;   // the IP column is consumed by the span
                 continue;
             }
@@ -222,18 +276,18 @@ QString buildTextReport(const QString& target,
     // or a soft failure of the send call) are invisible in the table but
     // matter when diagnosing unexplained single-packet losses — list them.
     {
-        QString notes;
+        std::string notes;
         for (size_t i = 0; i < state.size(); ++i)
             if (state[i].altCount > 0)
-                notes += QString("  Hop %1: replies also arrived from %2 (%3 time(s)) \u2014 route change or per-packet load balancing\n")
-                             .arg(i + 1)
-                             .arg(QString::fromStdString(addr_to_string(state[i].altAddr)))
-                             .arg(state[i].altCount);
+                notes += "  Hop " + std::to_string(i + 1) + ": replies also arrived from "
+                       + addr_to_string(state[i].altAddr) + " (" + std::to_string(state[i].altCount)
+                       + " time(s)) \xE2\x80\x94 route change or per-packet load balancing\n";   // em dash
         for (size_t i = 0; i < state.size(); ++i)
             if (state[i].anomalyCount > 0)
-                notes += QString("  Hop %1: %2 probe(s) ended with unexpected ICMP status/error: %3\n")
-                             .arg(i + 1).arg(state[i].anomalyCount).arg(describeStatus(state[i].anomalyLast, traceIsV6));
-        if (!notes.isEmpty())
+                notes += "  Hop " + std::to_string(i + 1) + ": " + std::to_string(state[i].anomalyCount)
+                       + " probe(s) ended with unexpected ICMP status/error: "
+                       + describeStatus(state[i].anomalyLast, traceIsV6) + "\n";
+        if (!notes.empty())
             out += "\nNotes:\n" + notes;
     }
     return out;
@@ -244,11 +298,11 @@ QString buildTextReport(const QString& target,
 // ==========================================================================
 
 bool warmupRouteSettled(WarmupFingerprint& fp,
-                         const std::vector<OpenMTRHostInfo>& state,
-                         int checkHops,
-                         qint64 elapsedMs)
+                        const std::vector<OpenMTRHostInfo>& state,
+                        int checkHops,
+                        int64_t elapsedMs)
 {
-    constexpr qint64 kWarmupDeadlineMs = 12000;
+    constexpr int64_t kWarmupDeadlineMs = 12000;
     // The route fingerprint (hop count plus every hop's address) must hold
     // steady for this many 250 ms ticks before we call it settled.
     // Responding hops probe on a ~1 s cycle, so the window spans one full
@@ -268,8 +322,8 @@ bool warmupRouteSettled(WarmupFingerprint& fp,
     // per-hop guard below settle it as well, so even an unreachable target
     // gets a complete, stable reveal. The deadline is only a backstop for
     // routes that never stop changing.
-    QByteArray newFp;
-    newFp.append(static_cast<char>(checkHops));
+    std::string newFp;
+    newFp += static_cast<char>(checkHops);
     for (int i = 0; i < checkHops; ++i) {
         const auto& a = state[i].addr;
         if (a.Ipv4.sin_family == AF_INET)
@@ -279,12 +333,12 @@ bool warmupRouteSettled(WarmupFingerprint& fp,
             newFp.append(reinterpret_cast<const char*>(&a.Ipv6.sin6_addr),
                          sizeof(a.Ipv6.sin6_addr));
         else
-            newFp.append('\0');
+            newFp += '\0';
     }
     // Any change to the route restarts the stability window.
     if (newFp != fp.fingerprint) {
-        fp.fingerprint  = newFp;
-        fp.stableCount  = 1;
+        fp.fingerprint = newFp;
+        fp.stableCount = 1;
         return false;
     }
     if (++fp.stableCount < kWarmupStableTicks)
@@ -304,9 +358,9 @@ bool warmupRouteSettled(WarmupFingerprint& fp,
 }
 
 bool dnsAndAsnSettled(DnsSettle& d,
-                       const std::vector<OpenMTRHostInfo>& state,
-                       bool asnPending,
-                       qint64 elapsedMs)
+                      const std::vector<OpenMTRHostInfo>& state,
+                      bool asnPending,
+                      int64_t elapsedMs)
 {
     // Consider reverse-DNS "settled" when every addressed hop shows a name
     // other than its bare IP, or when no new name has appeared for a few
